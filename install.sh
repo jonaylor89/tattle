@@ -17,8 +17,11 @@ FROM_SOURCE=0
 say() { printf '\033[1;33m ᘛ⁐ᕐᐷ \033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m ✗ \033[0m %s\n' "$*" >&2; exit 1; }
 
-command -v nft >/dev/null || fail "nftables is required (sudo pacman -S nftables)"
-command -v curl >/dev/null || fail "curl is required"
+for tool in nft curl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    fail "$tool is required (sudo pacman -S ${tool/nft/nftables})"
+  fi
+done
 
 case "$(uname -m)" in
   x86_64) ARCH=x86_64 ;;
@@ -46,9 +49,12 @@ fi
 
 if [[ -z $BIN ]]; then
   [[ -f $HERE/Cargo.toml ]] || fail "no source checkout next to this script"
-  command -v cargo >/dev/null || fail "building needs Rust: sudo pacman -S rust (or rustup)"
+  if ! command -v cargo >/dev/null 2>&1; then
+    fail "building needs Rust: sudo pacman -S rust (or rustup)"
+  fi
   say "Building tattle (release)…"
-  (cd "$HERE" && cargo build --release --locked 2>/dev/null || cargo build --release)
+  # --locked: exactly the dependency versions in Cargo.lock.
+  (cd "$HERE" && cargo build --release --locked)
   BIN="$HERE/target/release/tattle"
 fi
 
