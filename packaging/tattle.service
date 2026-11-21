@@ -1,0 +1,47 @@
+[Unit]
+Description=Tattle application firewall
+Documentation=https://github.com/jonaylor89/tattle
+# Be in place before the network comes up, so nothing slips out at boot.
+Wants=network-pre.target
+Before=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=simple
+# Load the netfilter pieces up front (the service itself may not load modules).
+ExecStartPre=-+/usr/bin/modprobe -a nfnetlink_queue nft_queue nf_conntrack nft_ct nft_reject_inet
+ExecStart=/usr/bin/tattle daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+
+StateDirectory=tattle
+StateDirectoryMode=0700
+RuntimeDirectory=tattle
+RuntimeDirectoryMode=0755
+
+# Root, but only with the powers it needs: nftables and NFQUEUE
+# (NET_ADMIN), reading every process's /proc entries to know who owns a
+# socket (SYS_PTRACE, DAC_READ_SEARCH), and handing the control socket to
+# the admin group (CHOWN).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

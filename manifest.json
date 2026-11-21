@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "tattle",
+  "name": "Tattle",
+  "version": "0.1.0",
+  "author": "jonaylor89",
+  "license": "MIT",
+  "description": "Application firewall in the spirit of Little Snitch: asks before apps phone home, shows live per-app traffic, and remembers your rules.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "plugin/Service.qml",
+    "barWidget": "plugin/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Tattle",
+    "description": "Firewall status, live traffic, mode and profile switching. Right click toggles filtering.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
