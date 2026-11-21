@@ -8,17 +8,18 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-      - run: cargo clippy --locked -- -D warnings
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
   build:
@@ -33,17 +34,34 @@ jobs:
             target: aarch64-unknown-linux-musl
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cross --locked
       # Static musl binaries: one file, runs on any distro.
       - run: cross build --locked --release --target ${{ matrix.target }}
       - name: Package
         run: |
-          cp target/${{ matrix.target }}/release/tattle tattle-${{ matrix.arch }}-linux
-          sha256sum tattle-${{ matrix.arch }}-linux > tattle-${{ matrix.arch }}-linux.sha256
-      - uses: softprops/action-gh-release@v2
+          mkdir dist
+          cp target/${{ matrix.target }}/release/tattle dist/tattle-${{ matrix.arch }}-linux
+          (cd dist && sha256sum tattle-${{ matrix.arch }}-linux > tattle-${{ matrix.arch }}-linux.sha256)
+      - uses: actions/upload-artifact@v7
         with:
-          files: |
-            tattle-${{ matrix.arch }}-linux
-            tattle-${{ matrix.arch }}-linux.sha256
+          name: tattle-${{ matrix.arch }}
+          path: dist/*
+
+  # One job publishes, so the two builds never race to create the release.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*

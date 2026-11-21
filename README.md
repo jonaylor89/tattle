@@ -18,7 +18,7 @@ desktop, and remembers your answer.
 
 <table>
 <tr>
-<td width="38%"><img src="docs/screenshots/panel.webp" alt="The Tattle bar panel: filtering switch, mode, profile, live traffic and recent blocks"></td>
+<td width="38%"><img src="docs/screenshots/panel.webp" alt="The Tattle bar panel: filtering switch, mode, profile, a map of where apps connect, live traffic and recent blocks"></td>
 <td><img src="docs/screenshots/monitor.png" alt="The tattle monitor: apps with live activity and the servers each one talked to"></td>
 </tr>
 <tr>
