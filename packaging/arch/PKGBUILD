@@ -1,6 +1,6 @@
 # Maintainer: jonaylor89
 pkgname=tattle
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Application firewall in the spirit of Little Snitch, with an Omarchy shell plugin"
 arch=('x86_64' 'aarch64')
