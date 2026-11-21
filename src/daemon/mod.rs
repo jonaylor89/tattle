@@ -85,7 +85,10 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let waker = Waker { tx, fd: pipe[1] };
-    let core = Arc::new(Mutex::new(Core::new(args.state_dir.clone(), waker.clone())));
+    let core = Arc::new(Mutex::new(Core::new(
+        args.state_dir.clone(),
+        waker.clone(),
+    )?));
     blocklist::rebuild(&core);
     conntrack::enable_accounting();
 

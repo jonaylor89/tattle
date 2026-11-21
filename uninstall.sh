@@ -4,7 +4,19 @@
 set -euo pipefail
 
 sudo systemctl disable --now tattle 2>/dev/null || true
-sudo rm -f /usr/lib/systemd/system/tattle.service /usr/bin/tattle
+if pacman -Qq tattle >/dev/null 2>&1; then
+  # Installed from packaging/arch: let pacman remove its own files and record.
+  sudo pacman -R --noconfirm tattle
+else
+  # Installed by install.sh: these are not owned by any package.
+  for f in /usr/bin/tattle /usr/lib/systemd/system/tattle.service; do
+    if owner="$(pacman -Qqo "$f" 2>/dev/null)"; then
+      echo "Leaving $f: it belongs to the '$owner' package." >&2
+    else
+      sudo rm -f "$f"
+    fi
+  done
+fi
 sudo systemctl daemon-reload
 # The daemon removes its table on shutdown; make sure even after a crash.
 sudo nft delete table inet tattle 2>/dev/null || true

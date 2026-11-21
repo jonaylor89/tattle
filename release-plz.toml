@@ -1,0 +1,9 @@
+[workspace]
+# The "tattle" name on crates.io belongs to another crate, and this one
+# isn't published there: read versions from git tags (v<version>) instead.
+git_only = true
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+# Release only when the release PR is merged, not on every push to main.
+release_always = false
+semver_check = false

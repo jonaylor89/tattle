@@ -1,0 +1,142 @@
+name: release-plz
+
+# On every push to main, release-plz opens (or updates) a release PR that
+# bumps Cargo.toml and CHANGELOG.md. Merging it tags v<version> and creates
+# the GitHub release; then this workflow builds the binaries from that tag,
+# attests their provenance, uploads them, and opens a PR that pins their
+# SHA-256 in packaging/checksums/ (what install.sh checks against) and syncs
+# the plugin and PKGBUILD versions.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          # A PAT lets CI run on the release PR; GITHUB_TOKEN works without.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.plz.outputs.releases_created }}
+      tag: ${{ fromJSON(steps.plz.outputs.releases || '[{}]')[0].tag }}
+      version: ${{ fromJSON(steps.plz.outputs.releases || '[{}]')[0].version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cross --locked
+      # Static musl binaries: one file, runs on any distro.
+      - run: cross build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/tattle dist/tattle-${{ matrix.arch }}-linux
+          (cd dist && sha256sum tattle-${{ matrix.arch }}-linux > tattle-${{ matrix.arch }}-linux.sha256)
+      # Signed provenance: ties the binary to this repo, workflow and tag.
+      # Check it with: gh attestation verify <file> -R jonaylor89/tattle
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/tattle-${{ matrix.arch }}-linux
+      - name: Upload to the release
+        run: gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tattle-${{ matrix.arch }}
+          path: dist/tattle-${{ matrix.arch }}-linux
+
+  pin:
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Pin hashes and sync versions
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          (cd dist && sha256sum tattle-*-linux | sort -k2) > "packaging/checksums/v$VERSION.sha256"
+          cat "packaging/checksums/v$VERSION.sha256"
+          jq --arg v "$VERSION" '.version = $v' manifest.json > manifest.json.new
+          mv manifest.json.new manifest.json
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/; s/^pkgrel=.*/pkgrel=1/" packaging/arch/PKGBUILD
+      - name: Open the pin PR
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          branch="pin/v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add packaging/checksums manifest.json packaging/arch/PKGBUILD
+          git commit -m "Pin v$VERSION release binaries"
+          git push -f origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Pin v$VERSION release binaries" \
+            --body "SHA-256 of the v$VERSION binaries this workflow built from tag v$VERSION and attested (\`gh attestation verify <file> -R $GITHUB_REPOSITORY\`). Until this is merged, install.sh builds from source. Also sets manifest.json and PKGBUILD to $VERSION."

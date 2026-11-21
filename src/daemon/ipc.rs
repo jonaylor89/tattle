@@ -220,25 +220,28 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
         ),
         Request::SetMode { mode } => {
             let mut c = core.lock().unwrap();
+            let prev = c.settings.clone();
             c.settings.mode = mode;
-            c.settings_changed();
+            c.settings_changed(prev)?;
             Ok(json!({}))
         }
         Request::SetEnabled { enabled } => {
             let mut c = core.lock().unwrap();
+            let prev = c.settings.clone();
             c.settings.enabled = enabled;
-            c.settings_changed();
+            c.settings_changed(prev)?;
             Ok(json!({}))
         }
         Request::SetProfile { profile } => {
             let mut c = core.lock().unwrap();
+            let prev = c.settings.clone();
             if let Some(p) = &profile
                 && !c.settings.profiles.contains(p)
             {
                 bail!("unknown profile '{p}'");
             }
             c.settings.active_profile = profile;
-            c.settings_changed();
+            c.settings_changed(prev)?;
             Ok(json!({}))
         }
         Request::AddProfile { name } => {
@@ -247,27 +250,29 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
                 bail!("profile name must be 1-64 characters");
             }
             let mut c = core.lock().unwrap();
+            let prev = c.settings.clone();
             if !c.settings.profiles.contains(&name) {
                 c.settings.profiles.push(name);
             }
-            c.settings_changed();
+            c.settings_changed(prev)?;
             Ok(json!({}))
         }
         Request::RemoveProfile { name } => {
             let mut c = core.lock().unwrap();
+            let prev = c.settings.clone();
             c.settings.profiles.retain(|p| *p != name);
             if c.settings.active_profile.as_deref() == Some(name.as_str()) {
                 c.settings.active_profile = None;
             }
             // Rules of a deleted profile would never apply again.
-            let before = c.rules.len();
+            let prev_rules = c.rules.clone();
             c.rules
                 .retain(|r| r.profile.as_deref() != Some(name.as_str()));
-            if c.rules.len() != before {
-                c.save_rules();
-                c.broadcast(&crate::proto::Event::RulesChanged);
+            // Settings first: if that fails nothing has been written yet.
+            c.settings_changed(prev)?;
+            if c.rules.len() != prev_rules.len() {
+                c.rules_changed(prev_rules)?;
             }
-            c.settings_changed();
             Ok(json!({}))
         }
         Request::SetSettings { settings } => {
@@ -284,6 +289,7 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
             blocklist::validate(&name, &url)?;
             {
                 let mut c = core.lock().unwrap();
+                let prev = c.settings.clone();
                 if c.settings.blocklists.iter().any(|b| b.name == name) {
                     bail!("a blocklist named '{name}' already exists");
                 }
@@ -295,7 +301,7 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
                     updated: None,
                     error: None,
                 });
-                c.settings_changed();
+                c.settings_changed(prev)?;
             }
             let core = core.clone();
             std::thread::spawn(move || blocklist::refresh(core, Some(name)));
@@ -304,13 +310,14 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
         Request::RemoveBlocklist { name } => {
             {
                 let mut c = core.lock().unwrap();
+                let prev = c.settings.clone();
                 let before = c.settings.blocklists.len();
                 c.settings.blocklists.retain(|b| b.name != name);
                 if before == c.settings.blocklists.len() {
                     return Err(anyhow!("no blocklist '{name}'"));
                 }
                 blocklist::remove_cache(&c.state_dir, &name);
-                c.settings_changed();
+                c.settings_changed(prev)?;
             }
             blocklist::rebuild(core);
             Ok(json!({}))
@@ -318,6 +325,7 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
         Request::SetBlocklistEnabled { name, enabled } => {
             {
                 let mut c = core.lock().unwrap();
+                let prev = c.settings.clone();
                 let b = c
                     .settings
                     .blocklists
@@ -326,7 +334,7 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
                     .ok_or_else(|| anyhow!("no blocklist '{name}'"))?;
                 b.enabled = enabled;
                 let needs_download = enabled && b.updated.is_none();
-                c.settings_changed();
+                c.settings_changed(prev)?;
                 if needs_download {
                     let core = core.clone();
                     std::thread::spawn(move || blocklist::refresh(core, Some(name)));
@@ -360,7 +368,7 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
             Ok(json!({}))
         }
         Request::ResetDefaults => {
-            core.lock().unwrap().reset_defaults();
+            core.lock().unwrap().reset_defaults()?;
             Ok(json!({}))
         }
     }

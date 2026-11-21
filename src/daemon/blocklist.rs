@@ -228,7 +228,7 @@ pub fn refresh(core: Arc<Mutex<Core>>, only: Option<String>) {
                 entry.error = Some(e.to_string());
             }
         }
-        c.save_settings();
+        let _ = c.save_settings();
     }
     core.lock().unwrap().blocklist_refreshing = false;
     rebuild(&core);

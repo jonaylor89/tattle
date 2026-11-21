@@ -401,7 +401,7 @@ pub fn download(core: Arc<Mutex<Core>>) {
             c.backfill_geo();
             if !c.settings.geo_auto_update {
                 c.settings.geo_auto_update = true;
-                c.save_settings();
+                let _ = c.save_settings();
             }
             log::info("location database ready");
         }

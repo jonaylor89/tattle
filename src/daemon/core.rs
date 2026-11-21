@@ -8,7 +8,7 @@ use super::geo::Geo;
 use crate::model::*;
 use crate::proto::{AppRate, Event};
 use crate::rules::{self, BlockSet};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -189,7 +189,7 @@ fn normalize_rule(r: &mut Rule) {
 }
 
 impl Core {
-    pub fn new(state_dir: PathBuf, waker: Waker) -> Core {
+    pub fn new(state_dir: PathBuf, waker: Waker) -> Result<Core> {
         let mut core = Core {
             settings: Settings::default(),
             rules: Vec::new(),
@@ -218,45 +218,39 @@ impl Core {
             geo: Geo::new(&state_dir),
             state_dir,
         };
-        core.load();
-        core
+        core.load()?;
+        Ok(core)
     }
 
     // ------------------------------------------------------------ storage
 
-    fn load(&mut self) {
-        let _ = std::fs::create_dir_all(&self.state_dir);
-        let settings_path = self.state_dir.join("settings.json");
-        if let Ok(s) = std::fs::read_to_string(&settings_path) {
-            match serde_json::from_str(&s) {
-                Ok(v) => self.settings = v,
-                Err(e) => log::warn(&format!(
-                    "ignoring unreadable {}: {e}",
-                    settings_path.display()
-                )),
+    /// Read saved settings and rules. A missing file means a fresh install
+    /// and gets defaults; a file that exists but cannot be parsed is moved
+    /// aside first, so nothing the operator wrote is ever overwritten. Any
+    /// other read error (permissions, I/O) stops startup rather than
+    /// replacing the operator's policy with defaults.
+    fn load(&mut self) -> Result<()> {
+        std::fs::create_dir_all(&self.state_dir)
+            .with_context(|| format!("creating {}", self.state_dir.display()))?;
+        let mut dirty = false;
+
+        match self.read_state::<Settings>("settings.json")? {
+            Some(v) => self.settings = v,
+            None => dirty = true,
+        }
+        match self.read_state::<Vec<Rule>>("rules.json")? {
+            Some(v) => self.rules = v,
+            None => {
+                self.rules = rules::default_rules();
+                dirty = true;
             }
         }
-        let rules_path = self.state_dir.join("rules.json");
-        match std::fs::read_to_string(&rules_path) {
-            Ok(s) => match serde_json::from_str::<Vec<Rule>>(&s) {
-                Ok(v) => self.rules = v,
-                Err(e) => {
-                    // Never silently drop someone's rules: keep the file aside.
-                    let aside = rules_path.with_extension(format!("json.broken-{}", now()));
-                    let _ = std::fs::rename(&rules_path, &aside);
-                    log::warn(&format!(
-                        "rules.json unreadable ({e}); moved to {}",
-                        aside.display()
-                    ));
-                    self.rules = rules::default_rules();
-                }
-            },
-            Err(_) => self.rules = rules::default_rules(),
-        }
+
         let mut seen = HashSet::new();
         for r in &mut self.rules {
             if r.id == 0 || !seen.insert(r.id) {
                 r.id = 0;
+                dirty = true;
             }
         }
         let mut next = self.rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
@@ -268,31 +262,75 @@ impl Core {
             }
         }
         self.next_rule_id = next;
-        // Process-bound rules cannot survive a daemon restart meaningfully
-        // only if their process is gone; gc() handles that.
-        self.save_rules();
-        self.save_settings();
+        if dirty {
+            self.save_settings()?;
+            self.save_rules()?;
+        }
+        Ok(())
     }
 
-    fn write_atomic(&self, name: &str, data: &str) {
+    /// `Ok(None)` when the file is absent, or was unparseable and has been
+    /// moved aside to `<name>.broken-<time>`.
+    fn read_state<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        let path = self.state_dir.join(name);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => bail!(
+                "cannot read {}: {e}; refusing to start with default policy",
+                path.display()
+            ),
+        };
+        match serde_json::from_str(&text) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                let aside = path.with_extension(format!("json.broken-{}", now()));
+                std::fs::rename(&path, &aside).with_context(|| {
+                    format!(
+                        "{} is unreadable ({e}) and could not be moved aside",
+                        path.display()
+                    )
+                })?;
+                log::warn(&format!(
+                    "{} unreadable ({e}); moved to {}, starting from defaults",
+                    path.display(),
+                    aside.display()
+                ));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Write `data` to a temp file, flush it to disk, then rename it over
+    /// `name`, so a crash leaves either the old file or the new one.
+    fn write_atomic(&self, name: &str, data: &str) -> Result<()> {
+        use std::io::Write;
         let path = self.state_dir.join(name);
         let tmp = self.state_dir.join(format!(".{name}.tmp"));
-        let res = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, &path));
+        let res = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(data.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            std::fs::File::open(&self.state_dir)?.sync_all()
+        })();
         if let Err(e) = res {
+            let _ = std::fs::remove_file(&tmp);
             log::warn(&format!("could not save {}: {e}", path.display()));
+            bail!("could not save {}: {e}", path.display());
         }
+        Ok(())
     }
 
-    pub fn save_rules(&self) {
-        if let Ok(s) = serde_json::to_string_pretty(&self.rules) {
-            self.write_atomic("rules.json", &s);
-        }
+    pub fn save_rules(&self) -> Result<()> {
+        self.write_atomic("rules.json", &serde_json::to_string_pretty(&self.rules)?)
     }
 
-    pub fn save_settings(&self) {
-        if let Ok(s) = serde_json::to_string_pretty(&self.settings) {
-            self.write_atomic("settings.json", &s);
-        }
+    pub fn save_settings(&self) -> Result<()> {
+        self.write_atomic(
+            "settings.json",
+            &serde_json::to_string_pretty(&self.settings)?,
+        )
     }
 
     // ------------------------------------------------------------ clients
@@ -510,7 +548,12 @@ impl Core {
             self.next_rule_id += 1;
             new_rule = Some(rule.id);
             self.rules.push(rule);
-            self.save_rules();
+            if let Err(e) = self.save_rules() {
+                // Leave the alert waiting so the user can retry or pick
+                // a one-off answer; don't pretend the rule exists.
+                self.rules.pop();
+                return Err(e);
+            }
         }
         self.resolve_prompt(id, d.action, Reason::Prompt, new_rule);
         if new_rule.is_some() {
@@ -570,6 +613,7 @@ impl Core {
     // ------------------------------------------------------------ rules API
 
     pub fn add_rule(&mut self, mut rule: Rule) -> Result<u64> {
+        let prev = self.rules.clone();
         validate_rule(&rule)?;
         normalize_rule(&mut rule);
         rule.id = self.next_rule_id;
@@ -581,11 +625,12 @@ impl Core {
         rule.last_hit = None;
         let id = rule.id;
         self.rules.push(rule);
-        self.rules_changed();
+        self.rules_changed(prev)?;
         Ok(id)
     }
 
     pub fn update_rule(&mut self, mut rule: Rule) -> Result<()> {
+        let prev = self.rules.clone();
         validate_rule(&rule)?;
         normalize_rule(&mut rule);
         let slot = self
@@ -597,52 +642,64 @@ impl Core {
         rule.last_hit = slot.last_hit;
         rule.created = slot.created;
         *slot = rule;
-        self.rules_changed();
-        Ok(())
+        self.rules_changed(prev)
     }
 
     pub fn delete_rule(&mut self, id: u64) -> Result<()> {
+        let prev = self.rules.clone();
         let before = self.rules.len();
         self.rules.retain(|r| r.id != id);
         if self.rules.len() == before {
             bail!("no rule {id}");
         }
-        self.rules_changed();
-        Ok(())
+        self.rules_changed(prev)
     }
 
     pub fn set_rule_enabled(&mut self, id: u64, enabled: bool) -> Result<()> {
+        let prev = self.rules.clone();
         let r = self
             .rules
             .iter_mut()
             .find(|r| r.id == id)
             .ok_or_else(|| anyhow!("no rule {id}"))?;
         r.enabled = enabled;
-        self.rules_changed();
-        Ok(())
+        self.rules_changed(prev)
     }
 
-    pub fn reset_defaults(&mut self) {
+    pub fn reset_defaults(&mut self) -> Result<()> {
+        let prev = self.rules.clone();
         self.rules.retain(|r| r.source != RuleSource::Default);
         for mut r in rules::default_rules() {
             r.id = self.next_rule_id;
             self.next_rule_id += 1;
             self.rules.push(r);
         }
-        self.rules_changed();
+        self.rules_changed(prev)
     }
 
-    fn rules_changed(&mut self) {
-        self.save_rules();
+    /// Persist a rules change. If it cannot be saved, put `prev` back and
+    /// report the error, so what the daemon enforces always matches what
+    /// survives a restart.
+    pub fn rules_changed(&mut self, prev: Vec<Rule>) -> Result<()> {
+        if let Err(e) = self.save_rules() {
+            self.rules = prev;
+            return Err(e);
+        }
         self.broadcast(&Event::RulesChanged);
         self.reevaluate_prompts();
         self.broadcast_status();
+        Ok(())
     }
 
-    pub fn settings_changed(&mut self) {
-        self.save_settings();
+    /// Like `rules_changed`, for settings.
+    pub fn settings_changed(&mut self, prev: Settings) -> Result<()> {
+        if let Err(e) = self.save_settings() {
+            self.settings = prev;
+            return Err(e);
+        }
         self.reevaluate_prompts();
         self.broadcast_status();
+        Ok(())
     }
 
     pub fn set_settings(&mut self, mut s: Settings) -> Result<bool> {
@@ -666,8 +723,8 @@ impl Core {
         // daemon's view of their status.
         s.blocklists = self.settings.blocklists.clone();
         let inbound_changed = s.inbound != self.settings.inbound;
-        self.settings = s;
-        self.settings_changed();
+        let prev = std::mem::replace(&mut self.settings, s);
+        self.settings_changed(prev)?;
         Ok(inbound_changed)
     }
 
@@ -1004,7 +1061,9 @@ impl Core {
             !matches!(r.lifetime, Lifetime::Until { at } if at <= now) && !dead.contains(&r.id)
         });
         if self.rules.len() != before {
-            self.save_rules();
+            // Expired rules no longer match either way; a failed save only
+            // means they are dropped again after a restart.
+            let _ = self.save_rules();
             self.broadcast(&Event::RulesChanged);
             return true;
         }
@@ -1180,7 +1239,90 @@ mod tests {
             std::thread::current().id()
         ));
         let (tx, _rx) = std::sync::mpsc::channel();
-        Core::new(dir, Waker { tx, fd: -1 })
+        Core::new(dir, Waker { tx, fd: -1 }).unwrap()
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tattle-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn core_at(dir: &std::path::Path) -> Result<Core> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Core::new(dir.to_path_buf(), Waker { tx, fd: -1 })
+    }
+
+    fn user_rule() -> Rule {
+        Rule::new(
+            Action::Deny,
+            "/usr/bin/curl",
+            Remote::Host("example.com".into()),
+        )
+    }
+
+    #[test]
+    fn rules_survive_a_restart() {
+        let dir = fresh_dir("restart");
+        let id = core_at(&dir).unwrap().add_rule(user_rule()).unwrap();
+        let c = core_at(&dir).unwrap();
+        assert!(c.rules.iter().any(|r| r.id == id));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unparseable_state_is_moved_aside_not_overwritten() {
+        let dir = fresh_dir("broken");
+        std::fs::write(dir.join("settings.json"), "{ not json").unwrap();
+        std::fs::write(dir.join("rules.json"), "[ not json").unwrap();
+        core_at(&dir).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for (prefix, body) in [
+            ("settings.json.broken-", "{ not json"),
+            ("rules.json.broken-", "[ not json"),
+        ] {
+            let aside = names.iter().find(|n| n.starts_with(prefix)).unwrap();
+            assert_eq!(std::fs::read_to_string(dir.join(aside)).unwrap(), body);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_state_stops_startup() {
+        let dir = fresh_dir("unreadable");
+        // Reading a directory fails with an I/O error other than NotFound.
+        std::fs::create_dir(dir.join("rules.json")).unwrap();
+        assert!(core_at(&dir).is_err());
+        assert!(dir.join("rules.json").is_dir());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_save_reports_an_error_and_keeps_the_old_rules() {
+        let dir = fresh_dir("savefail");
+        let mut c = core_at(&dir).unwrap();
+        let before = c.rules.clone();
+        let settings = c.settings.clone();
+        // Make every rename onto rules.json / settings.json fail, even as root.
+        std::fs::remove_file(dir.join("rules.json")).unwrap();
+        std::fs::create_dir(dir.join("rules.json")).unwrap();
+        std::fs::remove_file(dir.join("settings.json")).unwrap();
+        std::fs::create_dir(dir.join("settings.json")).unwrap();
+
+        assert!(c.add_rule(user_rule()).is_err());
+        assert_eq!(c.rules.len(), before.len());
+        assert!(c.delete_rule(before[0].id).is_err());
+        assert_eq!(c.rules.len(), before.len());
+
+        let mut s = settings.clone();
+        s.prompt_timeout = settings.prompt_timeout + 7;
+        assert!(c.set_settings(s).is_err());
+        assert_eq!(c.settings.prompt_timeout, settings.prompt_timeout);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn conn(exe: &str, host: &str, ip: &str) -> Connection {

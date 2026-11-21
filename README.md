@@ -74,9 +74,21 @@ omarchy plugin add https://github.com/jonaylor89/tattle --enable
 ```
 
 Click the new 󰈉 eye in your bar and press **Set up tattle**. That runs
-[`install.sh`](install.sh) in a terminal: it fetches the release binary (or builds
-from source), installs `/usr/bin/tattle` and `tattle.service`, and starts it. The eye
-opens 󰈈 when Tattle is watching.
+[`install.sh`](install.sh) in a terminal: it gets the binary, installs
+`/usr/bin/tattle` and `tattle.service`, and starts it. The eye opens 󰈈 when Tattle
+is watching.
+
+**Where the binary comes from.** The daemon runs as root, so `install.sh` only
+runs a binary tied to the checkout you installed. It downloads the release
+matching the version in `Cargo.toml` (never "latest") and checks it against a
+SHA-256 committed in this repository under
+[`packaging/checksums/`](packaging/checksums). The hash is not read from the
+release, which could be edited after the fact. If the checkout has no pinned
+hash for your architecture, the download fails, or you pass `--source`, it builds
+from this checkout with `cargo build --release --locked` instead. Release
+binaries are built by [CI](.github/workflows/ci.yml) from the tag and carry
+GitHub build provenance, which you can check yourself:
+`gh attestation verify tattle-x86_64-linux -R jonaylor89/tattle`.
 
 ### By hand
 
@@ -86,7 +98,8 @@ bash install.sh            # or: bash install.sh --source
 ```
 
 Or build the Arch package: `cd packaging/arch && makepkg -si`, then
-`sudo systemctl enable --now tattle`.
+`sudo systemctl enable --now tattle`. Pick one route: `install.sh` refuses to
+overwrite a pacman-installed tattle; update that one with pacman.
 
 Controlling Tattle requires membership in the `wheel` group (Omarchy's default user
 already has it).
@@ -252,6 +265,11 @@ and *Settings → Restore built-in rules* brings them back.
   are parsed as data, never executed.
 - The service runs with a reduced capability set and systemd sandboxing; see
   [`packaging/tattle.service`](packaging/tattle.service).
+- Rules and settings are written atomically (temp file, fsync, rename). If a change
+  can't be saved, it is rolled back and the request fails, so what's enforced
+  always matches what survives a restart. A saved file that can't be parsed is
+  moved aside, never overwritten; one that can't be read at all stops the
+  daemon from starting rather than falling back to defaults.
 
 ## Limitations
 
@@ -287,12 +305,29 @@ unshare -rn bash -c '
 The plugin honours `TATTLE_SOCKET`, and `TATTLE_ALERT_TEST=1` stops the alert from
 taking keyboard focus while you iterate on it.
 
+### Releasing
+
+Releases are automated with [release-plz](https://release-plz.dev)
+([workflow](.github/workflows/release-plz.yml)):
+
+1. Every push to `main` opens or updates a release PR that bumps `Cargo.toml` and
+   `CHANGELOG.md`.
+2. Merging it tags `v<version>` and creates the GitHub release. The same workflow
+   builds both static binaries from the tag, attests their provenance, and uploads
+   them.
+3. It then opens a *Pin v&lt;version&gt;* PR with the binaries' SHA-256 in
+   `packaging/checksums/` and the version synced into `manifest.json` and the
+   PKGBUILD. Until that's merged, `install.sh` builds from source.
+
 ## Uninstall
 
 ```bash
 bash uninstall.sh          # keeps your rules; --purge removes them
 omarchy plugin remove jonaylor89.tattle
 ```
+
+If you installed the Arch package, `uninstall.sh` removes it with `pacman -R`, so
+pacman's records stay correct; `sudo pacman -R tattle` does the same.
 
 ## Acknowledgements
 

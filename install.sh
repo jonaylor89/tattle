@@ -2,8 +2,14 @@
 # Install (or update) the tattle daemon, CLI and monitor.
 #
 # Run from a checkout, or let the Omarchy plugin run it for you:
-#   bash install.sh            # prebuilt release binary, else build from source
+#   bash install.sh            # pinned release binary, else build from source
 #   bash install.sh --source   # always build from source (needs cargo)
+#
+# The release binary is tied to this checkout: the version comes from
+# Cargo.toml, and its SHA-256 must match packaging/checksums/v<version>.sha256,
+# which is committed here (not fetched from the release, which is editable).
+# If this checkout has no pinned hash for your architecture, it builds from
+# source instead.
 #
 # Installs /usr/bin/tattle and tattle.service, then enables the service.
 
@@ -17,9 +23,10 @@ FROM_SOURCE=0
 say() { printf '\033[1;33m ᘛ⁐ᕐᐷ \033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m ✗ \033[0m %s\n' "$*" >&2; exit 1; }
 
-for tool in nft curl; do
+for tool in nft curl sha256sum; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    fail "$tool is required (sudo pacman -S ${tool/nft/nftables})"
+    case $tool in nft) pkg=nftables ;; sha256sum) pkg=coreutils ;; *) pkg=$tool ;; esac
+    fail "$tool is required (sudo pacman -S $pkg)"
   fi
 done
 
@@ -33,18 +40,32 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 BIN=""
 
-if (( ! FROM_SOURCE )) && [[ -n $ARCH ]]; then
-  URL="https://github.com/$REPO/releases/latest/download/tattle-$ARCH-linux"
-  say "Fetching the latest release for $ARCH…"
-  if curl -fsSL --proto '=https' --max-time 120 -o "$TMP/tattle" "$URL" \
-     && curl -fsSL --proto '=https' --max-time 60 -o "$TMP/tattle.sha256" "$URL.sha256"; then
-    (cd "$TMP" && echo "$(cut -d' ' -f1 tattle.sha256)  tattle" | sha256sum -c --quiet -) \
-      || fail "checksum mismatch on the downloaded binary"
+if pacman -Qq tattle >/dev/null 2>&1; then
+  fail "tattle is installed as a pacman package; update it with pacman (or remove it first: sudo pacman -R tattle)"
+fi
+
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$HERE/Cargo.toml" | head -n1)"
+PINS="$HERE/packaging/checksums/v$VERSION.sha256"
+ASSET="tattle-$ARCH-linux"
+WANT=""
+if [[ -n $ARCH && -f $PINS ]]; then
+  WANT="$(awk -v f="$ASSET" '$2 == f { print $1 }' "$PINS")"
+fi
+
+if (( ! FROM_SOURCE )) && [[ -n $WANT ]]; then
+  URL="https://github.com/$REPO/releases/download/v$VERSION/$ASSET"
+  say "Fetching release v$VERSION for $ARCH…"
+  if curl -fsSL --proto '=https' --max-time 120 -o "$TMP/tattle" "$URL"; then
+    GOT="$(sha256sum "$TMP/tattle" | cut -d' ' -f1)"
+    [[ $GOT == "$WANT" ]] \
+      || fail "checksum mismatch: v$VERSION $ASSET is $GOT, this checkout pins $WANT"
     chmod +x "$TMP/tattle"
     BIN="$TMP/tattle"
   else
-    say "No prebuilt release available; building from source instead."
+    say "Could not download release v$VERSION; building from source instead."
   fi
+elif (( ! FROM_SOURCE )); then
+  say "No pinned release binary for v$VERSION on $(uname -m); building from source."
 fi
 
 if [[ -z $BIN ]]; then

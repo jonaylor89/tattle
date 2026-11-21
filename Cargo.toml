@@ -8,6 +8,9 @@ repository = "https://github.com/jonaylor89/tattle"
 readme = "README.md"
 keywords = ["firewall", "nftables", "omarchy", "privacy", "network"]
 categories = ["command-line-utilities", "network-programming"]
+# Not part of the crate: CI rewrites these after each release (pinned hashes,
+# plugin/package version), and that must not count as a change to release.
+exclude = ["manifest.json", "packaging/arch/PKGBUILD", "packaging/checksums/"]
 
 [dependencies]
 anyhow = "1.0.104"
