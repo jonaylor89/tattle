@@ -34,7 +34,10 @@
   "hero.notRunning": "The tattle daemon isn't running",
   "hero.notInstalled": "Tattle isn't installed yet",
   "hero.off": "Filtering is off",
-  "hero.waiting": { "one": "%1 alert waiting", "other": "%1 alerts waiting" },
+  "hero.waiting": {
+    "one": "%1 alert waiting",
+    "other": "%1 alerts waiting"
+  },
   "alerts.show": "answer now",
   "setup.start": "The firewall daemon is installed but stopped. Starting it asks for your password.",
   "setup.install": "Tattle needs its firewall daemon. Setting it up opens a terminal and asks for your password.",
@@ -50,5 +53,19 @@
   "phrase.5": "Your apps are chatty today",
   "phrase.6": "Trust, but verify",
   "phrase.7": "Keeping an ear to the wire",
-  "phrase.8": "Who said you could do that?"
+  "phrase.8": "Who said you could do that?",
+  "section.map": "Where your apps connect",
+  "map.places": {
+    "one": "%1 place",
+    "other": "%1 places"
+  },
+  "map.countries": {
+    "one": "%1 country",
+    "other": "%1 countries"
+  },
+  "map.empty": "Nothing went out in the last hour.",
+  "map.missing": "See where your apps connect. This needs an offline location database; lookups stay on this machine.",
+  "map.download": "Get it (60 MB)",
+  "map.downloading": "Downloading location data from db-ip.com…",
+  "map.failed": "Download failed: %1"
 }

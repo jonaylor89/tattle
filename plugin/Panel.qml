@@ -14,7 +14,7 @@ Panel {
   moduleName: "tattle"
   ipcTarget: "tattle"
 
-  readonly property string pluginId: "tattle"
+  readonly property string pluginId: "jonaylor89.tattle"
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color accent: Commons.Color.accent
@@ -33,6 +33,19 @@ Panel {
   property var recentDenied: []
   property bool daemonInstalled: true
   property string actionError: ""
+
+  // The map: places your apps talked to in the last hour.
+  property var mapView: null
+  readonly property var mapPlaces: mapView && mapView.places instanceof Array ? mapView.places : []
+  readonly property string geoState: mapView && mapView.geo ? String(mapView.geo.state || "missing") : ""
+  readonly property int mapCountries: {
+    var seen = {}, n = 0
+    for (var i = 0; i < mapPlaces.length; i++) {
+      var cc = String(mapPlaces[i].cc || "")
+      if (cc && !seen[cc]) { seen[cc] = true; n++ }
+    }
+    return n
+  }
 
   // Keyboard cursor: 0 switch, 1 mode, 2 profile, 3 alerts, 4 open monitor.
   property int cursor: -1
@@ -97,6 +110,27 @@ Panel {
   function openMonitor() {
     Quickshell.execDetached(["omarchy-launch-tui", "tattle"])
     close()
+  }
+
+  function openMap() {
+    Quickshell.execDetached(["omarchy-launch-tui", "tattle", "map"])
+    close()
+  }
+
+  function refreshMap() {
+    client.call("map", { since: 3600, limit: 0 }, function(ok, data) {
+      // An older daemon without a map simply hides the section.
+      root.mapView = ok && data && data.geo ? data : null
+    })
+  }
+
+  function placeLine(p) {
+    if (!p) return ""
+    var where = p.city ? p.city + (p.country ? ", " + p.country : "") : (p.country || p.cc || "")
+    var apps = p.apps instanceof Array && p.apps.length ? " — " + p.apps.slice(0, 3).join(", ") : ""
+    var bytes = (Number(p.tx) || 0) + (Number(p.rx) || 0)
+    var tail = bytes > 0 ? " · " + Model.bytes(bytes) : ((Number(p.denied) || 0) > 0 ? " · ✗ " + p.denied : "")
+    return Model.clip(where, 40) + Model.clip(apps, 60) + tail
   }
 
   function setup() {
@@ -193,6 +227,14 @@ Panel {
 
   Timer { id: flashTimer; interval: 900; onTriggered: root.flash = false }
 
+  Timer {
+    interval: 2000
+    repeat: true
+    triggeredOnStart: true
+    running: root.opened && root.connected
+    onTriggered: root.refreshMap()
+  }
+
   Process {
     id: whichProc
     command: ["sh", "-c", "command -v tattle >/dev/null"]
@@ -238,7 +280,7 @@ Panel {
     open: root.opened
     focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(360))
-    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(620))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(1100))
 
     content: PanelKeyCatcher {
       id: keyCatcher
@@ -417,6 +459,87 @@ Panel {
             }
 
             PanelSeparator { width: parent.width; foreground: root.foreground }
+
+            // Where your apps connect.
+            Column {
+              visible: root.mapView !== null
+              width: parent.width
+              spacing: Style.space(6)
+              Item {
+                width: parent.width
+                height: mapHeader.implicitHeight
+                PanelSectionHeader { id: mapHeader; text: strings.t("section.map"); foreground: root.foreground; fontFamily: root.fontFamily }
+                Text {
+                  visible: root.geoState === "ready"
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: strings.tn("map.places", root.mapPlaces.length).arg(root.mapPlaces.length)
+                    + " · " + strings.tn("map.countries", root.mapCountries).arg(root.mapCountries)
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              WorldMap {
+                id: worldMap
+                visible: root.geoState === "ready"
+                width: parent.width
+                places: root.mapPlaces
+                home: root.mapView ? root.mapView.home : null
+                foreground: root.foreground
+                accent: root.accent
+                urgent: root.urgent
+                running: root.opened
+                onClicked: root.openMap()
+              }
+              Text {
+                visible: root.geoState === "ready"
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.mapPlaces.length === 0 ? strings.t("map.empty") : root.placeLine(worldMap.hovered || root.mapPlaces[0])
+                color: worldMap.hovered ? root.foreground : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+              // No location data yet.
+              Item {
+                visible: root.geoState === "missing" || root.geoState === "downloading"
+                width: parent.width
+                implicitHeight: Math.max(geoText.implicitHeight, geoButton.implicitHeight)
+                Text {
+                  id: geoText
+                  anchors.left: parent.left
+                  anchors.right: geoButton.visible ? geoButton.left : parent.right
+                  anchors.rightMargin: Style.space(10)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: root.geoState === "downloading" ? strings.t("map.downloading")
+                    : (root.mapView && root.mapView.geo && root.mapView.geo.error
+                      ? strings.t("map.failed").arg(Model.clip(root.mapView.geo.error, 120))
+                      : strings.t("map.missing"))
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WordWrap
+                }
+                Button {
+                  id: geoButton
+                  visible: root.geoState === "missing"
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: strings.t("map.download")
+                  foreground: root.foreground
+                  bordered: true
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  onClicked: client.call("geo_update", {}, function() { root.refreshMap() })
+                }
+              }
+            }
+
+            PanelSeparator { visible: root.mapView !== null; width: parent.width; foreground: root.foreground }
 
             // Live traffic.
             Column {

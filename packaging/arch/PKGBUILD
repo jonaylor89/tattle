@@ -8,6 +8,7 @@ url="https://github.com/jonaylor89/tattle"
 license=('MIT')
 depends=('nftables' 'curl' 'gcc-libs' 'glibc')
 makedepends=('cargo')
+optdepends=('geoipupdate: keep a MaxMind GeoLite2 database for the map instead of DB-IP')
 backup=()
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')

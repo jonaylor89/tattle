@@ -2,6 +2,7 @@ pub mod blocklist;
 pub mod conntrack;
 pub mod core;
 pub mod dns;
+pub mod geo;
 pub mod ipc;
 pub mod netlink;
 pub mod nft;
@@ -182,6 +183,7 @@ fn stats_loop(core: Arc<Mutex<Core>>) {
     let mut last_gc = Instant::now();
     let mut last_prune = Instant::now();
     let mut last_blocklist_check = Instant::now() - Duration::from_secs(3600);
+    let mut last_geo_check = Instant::now();
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let elapsed = last.elapsed().as_secs_f64();
@@ -251,6 +253,15 @@ fn stats_loop(core: Arc<Mutex<Core>>) {
         } else {
             None
         };
+        // A location database installed or updated by something else.
+        let mut geo_due = false;
+        if last_geo_check.elapsed() > Duration::from_secs(60) {
+            last_geo_check = Instant::now();
+            if c.geo.reload() {
+                c.backfill_geo();
+            }
+            geo_due = c.settings.geo_auto_update && !c.geo.downloading && c.geo.update_due();
+        }
         let check_lists = last_blocklist_check.elapsed() > Duration::from_secs(600);
         let lists_due = check_lists
             && !c.blocklist_refreshing
@@ -264,6 +275,10 @@ fn stats_loop(core: Arc<Mutex<Core>>) {
                 .map(|(id, _, _)| id)
                 .collect();
             core.lock().unwrap().expire_rules(&dead);
+        }
+        if geo_due {
+            let c = core.clone();
+            std::thread::spawn(move || geo::download(c));
         }
         if check_lists {
             last_blocklist_check = Instant::now();

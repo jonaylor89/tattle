@@ -279,6 +279,17 @@ Item {
               font.pixelSize: Style.font.body
               elide: Text.ElideRight
             }
+            // Where the server is, when a location database is installed.
+            Text {
+              width: parent.width
+              visible: text !== ""
+              textFormat: Text.PlainText
+              text: Model.placeLine(root.current ? root.current.geo : null)
+              color: root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              elide: Text.ElideRight
+            }
             Text {
               width: parent.width
               textFormat: Text.PlainText

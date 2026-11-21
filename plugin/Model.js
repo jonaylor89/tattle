@@ -103,3 +103,11 @@ function iconFor(exe, lookup, iconPath) {
   }
   return iconPath(name, true) || ""
 }
+
+// "󰍎 Frankfurt, Germany · Amazon.com, Inc." from a prompt's geo field.
+function placeLine(geo) {
+  if (!geo) return ""
+  var where = geo.city ? geo.city + (geo.country ? ", " + geo.country : "") : (geo.country || geo.cc || "")
+  if (!where) return ""
+  return "󰍎 " + clip(where, 60) + (geo.org ? "  ·  " + clip(geo.org, 60) : "")
+}

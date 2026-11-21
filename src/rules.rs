@@ -663,6 +663,7 @@ mod tests {
             attempts: 1,
             domain: Some("github.com".into()),
             service: Some("https".into()),
+            geo: None,
         };
         let d = Decision {
             action: Action::Allow,

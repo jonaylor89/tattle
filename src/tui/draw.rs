@@ -11,12 +11,12 @@ use ratatui::widgets::{
 };
 
 // The palette is the terminal's own, so Omarchy themes restyle us for free.
-const ACCENT: Color = Color::Yellow;
-const OK: Color = Color::Green;
-const BAD: Color = Color::Red;
-const INFO: Color = Color::Cyan;
-const UP: Color = Color::Magenta;
-const DIM: Color = Color::DarkGray;
+pub(super) const ACCENT: Color = Color::Yellow;
+pub(super) const OK: Color = Color::Green;
+pub(super) const BAD: Color = Color::Red;
+pub(super) const INFO: Color = Color::Cyan;
+pub(super) const UP: Color = Color::Magenta;
+pub(super) const DIM: Color = Color::DarkGray;
 
 const RAT: &str = "ᘛ⁐ᕐᐷ";
 
@@ -31,17 +31,17 @@ const TAGLINES: &[&str] = &[
     "who said you could do that?",
 ];
 
-fn dim() -> Style {
+pub(super) fn dim() -> Style {
     Style::new().fg(DIM)
 }
 
-fn sel_style() -> Style {
+pub(super) fn sel_style() -> Style {
     Style::new().add_modifier(Modifier::REVERSED)
 }
 
 pub use crate::cli::local_time;
 
-fn rate(b: u64) -> String {
+pub(super) fn rate(b: u64) -> String {
     if b == 0 {
         "—".into()
     } else {
@@ -67,7 +67,7 @@ fn spark(h: Option<&VecDeque<u64>>, width: usize) -> String {
     s
 }
 
-fn ago(ts: u64) -> String {
+pub(super) fn ago(ts: u64) -> String {
     if ts == 0 {
         return "—".into();
     }
@@ -79,7 +79,7 @@ fn ago(ts: u64) -> String {
     }
 }
 
-fn panel<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
+pub(super) fn panel<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
     Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -91,7 +91,7 @@ fn panel<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
         .title(title)
 }
 
-fn centered(area: Rect, w: u16, h: u16) -> Rect {
+pub(super) fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let [v] = Layout::vertical([Constraint::Length(h.min(area.height))])
         .flex(Flex::Center)
         .areas(area);
@@ -114,6 +114,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_tabs(f, app, tabs);
     match app.tab {
         Tab::Monitor => draw_monitor(f, app, body),
+        Tab::Map => super::map::draw_map(f, app, body),
         Tab::Rules => draw_rules(f, app, body),
         Tab::Log => draw_log(f, app, body),
         Tab::Blocklists => draw_blocklists(f, app, body),
@@ -313,7 +314,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn filter_title(app: &App) -> Span<'static> {
+pub(super) fn filter_title(app: &App) -> Span<'static> {
     if app.filtering || !app.filter.value.is_empty() {
         Span::styled(
             format!(
@@ -469,6 +470,10 @@ fn draw_monitor(f: &mut Frame, app: &App, area: Rect) {
                     Cell::from(Span::styled(g, Style::new().fg(c))),
                     Cell::from(rm.host.clone()),
                     Cell::from(Span::styled(
+                        rm.geo.as_ref().map(|g| g.cc.clone()).unwrap_or_default(),
+                        dim(),
+                    )),
+                    Cell::from(Span::styled(
                         format!("{}/{}", rm.proto, ports.join(",")),
                         dim(),
                     )),
@@ -495,13 +500,14 @@ fn draw_monitor(f: &mut Frame, app: &App, area: Rect) {
             [
                 Constraint::Length(1),
                 Constraint::Fill(1),
+                Constraint::Length(2),
                 Constraint::Length(12),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(8),
             ],
         )
-        .header(Row::new(vec!["", "server", "port", "sent", "recv", "seen"]).style(dim()))
+        .header(Row::new(vec!["", "server", "", "port", "sent", "recv", "seen"]).style(dim()))
         .row_highlight_style(if app.focus == Focus::Remotes {
             sel_style()
         } else {
@@ -950,6 +956,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("n", "new rule"),
             ("s", "sort"),
         ],
+        Tab::Map if app.map_servers => &[
+            ("↑↓", "server"),
+            ("←", "places"),
+            ("a/d", "allow/deny"),
+            ("w", "time window"),
+        ],
+        Tab::Map => &[
+            ("↑↓", "place"),
+            ("→", "servers"),
+            ("w", "time window"),
+            ("u", "update location data"),
+        ],
         Tab::Rules => &[
             ("↑↓", "select"),
             ("enter", "edit"),
@@ -994,7 +1012,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let r = centered(area, 72, 24);
+    let r = centered(area, 72, 27);
     f.render_widget(Clear, r);
     let k = |key: &str, what: &str| {
         Line::from(vec![
@@ -1008,7 +1026,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ))
         .bold(),
         Line::from(""),
-        k("1-5 / ⇧tab", "switch tabs"),
+        k("1-6 / ⇧tab", "switch tabs"),
         k("/", "filter the current list"),
         k("m", "cycle mode: alert → silent allow → silent deny"),
         k("F", "turn filtering on or off"),
@@ -1019,6 +1037,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         k("↑↓ ←→", "pick server, port, process and duration"),
         k("s p o f", "cycle server / port / process / duration"),
         k("esc", "decide later (the countdown keeps running)"),
+        Line::from(""),
+        Line::styled("  on the map", dim()),
+        k("w", "time window: last minute, hour, day, since start"),
+        k("→ then a / d", "allow / deny one app → server from a place"),
         Line::from(""),
         Line::styled("  rule precedence (strongest first)", dim()),
         Line::from("    exact host › domain › IP range › local network › any server"),
@@ -1130,8 +1152,8 @@ fn chips<'a>(opts: &[String], sel: usize, focused: bool) -> Vec<Span<'a>> {
 fn draw_alert(f: &mut Frame, app: &App, area: Rect) {
     let p = &app.prompts[0];
     let c = &p.conn;
-    // 4 rows of header, 4 of choices, 2 of buttons, spacing, borders and margins.
-    let r = centered(area, 100, 16);
+    // 5 rows of header, 4 of choices, 2 of buttons, spacing, borders and margins.
+    let r = centered(area, 100, 17);
     f.render_widget(Clear, r);
     let title = if app.prompts.len() > 1 {
         format!(" ⚑ connection alert · 1 of {} ", app.prompts.len())
@@ -1185,7 +1207,18 @@ fn draw_alert(f: &mut Frame, app: &App, area: Rect) {
     if !c.hostnames.is_empty() {
         meta.push_str(&format!(" · {}", canonical_ip(c.remote_ip)));
     }
-    let mut head = vec![Line::from(who), host_line, Line::styled(meta, dim())];
+    let mut head = vec![Line::from(who), host_line];
+    if let Some(g) = &p.geo {
+        let mut spans = vec![
+            Span::styled("in ", dim()),
+            Span::styled(g.place(), Style::new().fg(INFO)),
+        ];
+        if let Some(org) = &g.org {
+            spans.push(Span::styled(format!(" · {org}"), dim()));
+        }
+        head.push(Line::from(spans));
+    }
+    head.push(Line::styled(meta, dim()));
     if c.process.exe_deleted {
         head.push(Line::styled(
             "⚠ this program's file changed since it started",
@@ -1196,7 +1229,7 @@ fn draw_alert(f: &mut Frame, app: &App, area: Rect) {
         head.push(Line::styled(format!("script: {s}"), dim()));
     }
     let [h, _, opts, _, buttons] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Length(4),
         Constraint::Length(1),

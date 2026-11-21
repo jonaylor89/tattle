@@ -520,6 +520,10 @@ pub struct Settings {
     pub blocklists: Vec<Blocklist>,
     /// Hours between blocklist refreshes; 0 disables automatic refresh.
     pub blocklist_refresh_hours: u64,
+    /// Where the map draws "you". None: the time zone's city.
+    pub home: Option<Coord>,
+    /// Refresh the downloaded location database monthly.
+    pub geo_auto_update: bool,
 }
 
 impl Default for Settings {
@@ -535,6 +539,8 @@ impl Default for Settings {
             active_profile: None,
             blocklists: Vec::new(),
             blocklist_refresh_hours: 24,
+            home: None,
+            geo_auto_update: false,
         }
     }
 }
@@ -552,6 +558,9 @@ pub struct Prompt {
     pub domain: Option<String>,
     /// Well-known name of the port, e.g. "https".
     pub service: Option<String>,
+    /// Where the server is, if a location database is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<GeoInfo>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -629,6 +638,16 @@ pub struct RemoteStats {
     pub rx: u64,
     pub last_seen: u64,
     pub last_action: Option<Action>,
+    /// Open connections right now, and bytes per second over the last sample.
+    #[serde(default)]
+    pub active: u32,
+    #[serde(default)]
+    pub tx_rate: u64,
+    #[serde(default)]
+    pub rx_rate: u64,
+    /// Where the server is, if a location database is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<GeoInfo>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -931,4 +950,188 @@ mod tests {
         assert!(!is_local_ip("1.1.1.1".parse().unwrap()));
         assert!(!is_local_ip("2606:4700::1111".parse().unwrap()));
     }
+}
+
+// ------------------------------------------------------------------ map
+
+/// A point on the globe, in degrees.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+pub struct Coord {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl Coord {
+    /// Parse "52.52,13.40" (or with a space instead of the comma).
+    pub fn parse(s: &str) -> Result<Coord, String> {
+        let parts: Vec<&str> = s
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let bad = || format!("expected LAT,LON in degrees (e.g. 52.52,13.40), got '{s}'");
+        if parts.len() != 2 {
+            return Err(bad());
+        }
+        let lat: f64 = parts[0].parse().map_err(|_| bad())?;
+        let lon: f64 = parts[1].parse().map_err(|_| bad())?;
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            return Err("latitude must be within ±90 and longitude within ±180".into());
+        }
+        Ok(Coord { lat, lon })
+    }
+
+    /// Great-circle distance in kilometres.
+    pub fn distance_km(self, o: Coord) -> f64 {
+        let (p1, p2) = (self.lat.to_radians(), o.lat.to_radians());
+        let dp = p2 - p1;
+        let dl = (o.lon - self.lon).to_radians();
+        let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+        6371.0 * 2.0 * a.sqrt().min(1.0).asin()
+    }
+}
+
+/// What the location database knows about one address.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct GeoInfo {
+    pub lat: f64,
+    pub lon: f64,
+    /// ISO 3166 country code, e.g. "DE".
+    #[serde(default)]
+    pub cc: String,
+    #[serde(default)]
+    pub country: String,
+    #[serde(default)]
+    pub city: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    /// The network's owner, e.g. "Amazon.com, Inc.".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+}
+
+impl GeoInfo {
+    /// "Frankfurt, Germany", or just the country.
+    pub fn place(&self) -> String {
+        match (self.city.is_empty(), self.country.is_empty()) {
+            (false, false) => format!("{}, {}", self.city, self.country),
+            (true, false) => self.country.clone(),
+            (false, true) => self.city.clone(),
+            (true, true) => self.cc.clone(),
+        }
+    }
+}
+
+/// Where the map puts you.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct Home {
+    pub lat: f64,
+    pub lon: f64,
+    /// "New York (time zone)" or "set by you".
+    pub label: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GeoState {
+    /// No database installed.
+    #[default]
+    Missing,
+    Downloading,
+    Ready,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct GeoStatus {
+    pub state: GeoState,
+    /// Attribution for the database in use, e.g. "DB-IP City Lite (2026-11)".
+    pub source: Option<String>,
+    /// Where the database lives.
+    pub path: Option<String>,
+    /// Owner names come from a separate ASN database.
+    pub has_asn: bool,
+    /// Why the last download failed.
+    pub error: Option<String>,
+}
+
+/// One server as the map sees it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct MapServer {
+    pub app: String,
+    pub identity: String,
+    pub host: String,
+    pub ip: String,
+    pub ports: Vec<u16>,
+    pub org: Option<String>,
+    pub tx: u64,
+    pub rx: u64,
+    pub tx_rate: u64,
+    pub rx_rate: u64,
+    pub active: u32,
+    pub allowed: u64,
+    pub denied: u64,
+    pub last_seen: u64,
+    pub last_action: Option<Action>,
+}
+
+/// Every server at one location, rolled up.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct MapPlace {
+    pub lat: f64,
+    pub lon: f64,
+    pub cc: String,
+    pub country: String,
+    pub city: String,
+    /// Distinct network owners here, busiest first.
+    pub orgs: Vec<String>,
+    /// Distinct apps here, busiest first.
+    pub apps: Vec<String>,
+    pub tx: u64,
+    pub rx: u64,
+    pub tx_rate: u64,
+    pub rx_rate: u64,
+    pub active: u32,
+    pub allowed: u64,
+    pub denied: u64,
+    pub last_seen: u64,
+    /// Busiest first, capped; `more` counts the rest.
+    pub servers: Vec<MapServer>,
+    pub more: usize,
+}
+
+impl MapPlace {
+    pub fn place(&self) -> String {
+        GeoInfo {
+            cc: self.cc.clone(),
+            country: self.country.clone(),
+            city: self.city.clone(),
+            ..Default::default()
+        }
+        .place()
+    }
+
+    /// Something here is transferring data or holds an open connection.
+    pub fn live(&self) -> bool {
+        self.active > 0 || self.tx_rate + self.rx_rate > 0
+    }
+
+    /// Everything here was blocked.
+    pub fn blocked(&self) -> bool {
+        self.allowed == 0 && self.denied > 0
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct MapView {
+    pub home: Option<Home>,
+    pub geo: GeoStatus,
+    /// Busiest first.
+    pub places: Vec<MapPlace>,
+    /// Servers on the local network (they have no place on a world map).
+    pub local: usize,
+    /// Public servers the database could not place.
+    pub unlocated: usize,
 }

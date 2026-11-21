@@ -92,6 +92,21 @@ pub enum Request {
         enabled: bool,
     },
     RefreshBlocklists,
+    /// Servers rolled up by location, for the map.
+    Map {
+        /// Only servers seen in the last so many seconds.
+        #[serde(default)]
+        since: Option<u64>,
+        /// Servers listed per place (default 40).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Download (or refresh) the free DB-IP location database.
+    GeoUpdate,
+    /// Where an address is, according to the location database.
+    Locate {
+        ip: std::net::IpAddr,
+    },
     ResetStats,
     ResetDefaults,
 }
@@ -135,7 +150,9 @@ pub struct AppRate {
     pub active: u32,
 }
 
-/// Any line the daemon sends.
+/// Any line the daemon sends. Short-lived (parsed, then matched), so the
+/// size difference between variants doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub enum Incoming {

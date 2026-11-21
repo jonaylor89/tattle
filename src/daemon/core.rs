@@ -4,6 +4,7 @@
 
 use super::conntrack::{Flow, FlowKey};
 use super::dns::DnsCache;
+use super::geo::Geo;
 use crate::model::*;
 use crate::proto::{AppRate, Event};
 use crate::rules::{self, BlockSet};
@@ -96,6 +97,7 @@ pub struct Core {
     rx_total: u64,
     pub inbound_active: bool,
     pub blocklist_refreshing: bool,
+    pub geo: Geo,
 }
 
 fn flow_key(conn: &Connection) -> FlowKey {
@@ -203,7 +205,6 @@ impl Core {
             clients: Vec::new(),
             next_client_id: 1,
             waker,
-            state_dir,
             started: now(),
             own_pid: std::process::id(),
             allowed: 0,
@@ -214,6 +215,8 @@ impl Core {
             rx_total: 0,
             inbound_active: false,
             blocklist_refreshing: false,
+            geo: Geo::new(&state_dir),
+            state_dir,
         };
         core.load();
         core
@@ -448,8 +451,10 @@ impl Core {
                 }
                 let id = self.next_prompt_id;
                 self.next_prompt_id += 1;
+                let geo = self.geo.lookup(conn.remote_ip);
                 let prompt = Prompt {
                     id,
+                    geo,
                     domain: conn.hostnames.first().and_then(|h| registrable_domain(h)),
                     service: service_name(
                         conn.proto,
@@ -644,6 +649,14 @@ impl Core {
         s.prompt_timeout = s.prompt_timeout.clamp(5, 3600);
         s.profiles.retain(|p| !p.trim().is_empty() && p.len() <= 64);
         s.profiles.dedup();
+        if let Some(h) = s.home
+            && !(h.lat.is_finite()
+                && h.lon.is_finite()
+                && h.lat.abs() <= 90.0
+                && h.lon.abs() <= 180.0)
+        {
+            bail!("home must be a latitude within ±90 and a longitude within ±180");
+        }
         if let Some(a) = &s.active_profile
             && !s.profiles.contains(a)
         {
@@ -669,6 +682,7 @@ impl Core {
         count: u64,
     ) {
         let now = now();
+        let geo = self.geo.lookup(conn.remote_ip);
         match action {
             Action::Allow => self.allowed += count,
             Action::Deny => self.denied += count,
@@ -734,6 +748,9 @@ impl Core {
                 ..Default::default()
             });
         r.ip = canonical_ip(conn.remote_ip).to_string();
+        if geo.is_some() {
+            r.geo = geo;
+        }
         let port = if conn.direction == Direction::Out {
             conn.remote_port
         } else {
@@ -792,6 +809,7 @@ impl Core {
             Some(conn) => {
                 let identity = conn.identity();
                 let rk = remote_key(&conn);
+                let geo = self.geo.lookup(conn.remote_ip);
                 let app = self.apps.entry(identity.clone()).or_insert_with(|| App {
                     stats: AppStats {
                         identity: identity.clone(),
@@ -816,6 +834,7 @@ impl Core {
                         } else {
                             conn.local_port
                         }],
+                        geo,
                         ..Default::default()
                     });
                 self.flows.insert(
@@ -839,6 +858,12 @@ impl Core {
             a.tick_tx = 0;
             a.tick_rx = 0;
             a.stats.active = 0;
+            for r in a.remotes.values_mut() {
+                // Until the end of this pass these hold bytes, not rates.
+                r.active = 0;
+                r.tx_rate = 0;
+                r.rx_rate = 0;
+            }
         }
         let now = now();
         for f in flows {
@@ -872,6 +897,11 @@ impl Core {
                 if let Some(r) = app.remotes.get_mut(&info.remote_key) {
                     r.tx += tx;
                     r.rx += rx;
+                    r.tx_rate += tx;
+                    r.rx_rate += rx;
+                    if counts_as_open {
+                        r.active += 1;
+                    }
                     if tx + rx > 0 {
                         r.last_seen = now;
                     }
@@ -889,6 +919,10 @@ impl Core {
         for a in self.apps.values_mut() {
             a.stats.tx_rate = (a.tick_tx as f64 / secs) as u64;
             a.stats.rx_rate = (a.tick_rx as f64 / secs) as u64;
+            for r in a.remotes.values_mut() {
+                r.tx_rate = (r.tx_rate as f64 / secs) as u64;
+                r.rx_rate = (r.rx_rate as f64 / secs) as u64;
+            }
             ttx += a.tick_tx;
             trx += a.tick_rx;
             if a.stats.active > 0 || a.stats.tx_rate + a.stats.rx_rate > 0 {
@@ -1008,6 +1042,113 @@ impl Core {
         }
     }
 
+    /// Place every known server once a location database becomes available.
+    pub fn backfill_geo(&mut self) {
+        for app in self.apps.values_mut() {
+            for r in app.remotes.values_mut() {
+                r.geo = r.ip.parse().ok().and_then(|ip| self.geo.lookup(ip));
+            }
+        }
+    }
+
+    /// Servers rolled up by location, for the map. `since`: only servers
+    /// seen in the last so many seconds (open connections always count).
+    /// `limit`: servers listed per place.
+    pub fn map_view(&self, since: Option<u64>, limit: usize) -> MapView {
+        let cutoff = since.map(|s| now().saturating_sub(s));
+        let mut places: HashMap<(i64, i64), MapPlace> = HashMap::new();
+        let (mut local, mut unlocated) = (0, 0);
+        for app in self.apps.values() {
+            for r in app.remotes.values() {
+                if cutoff.is_some_and(|c| r.last_seen < c) && r.active == 0 {
+                    continue;
+                }
+                let Some(g) = &r.geo else {
+                    match r.ip.parse::<IpAddr>() {
+                        Ok(ip) if is_local_ip(ip) => local += 1,
+                        _ => unlocated += 1,
+                    }
+                    continue;
+                };
+                // Same city in the database means the same coordinates.
+                let key = ((g.lat * 10.0).round() as i64, (g.lon * 10.0).round() as i64);
+                let p = places.entry(key).or_insert_with(|| MapPlace {
+                    lat: g.lat,
+                    lon: g.lon,
+                    cc: g.cc.clone(),
+                    country: g.country.clone(),
+                    city: g.city.clone(),
+                    ..Default::default()
+                });
+                p.tx += r.tx;
+                p.rx += r.rx;
+                p.tx_rate += r.tx_rate;
+                p.rx_rate += r.rx_rate;
+                p.active += r.active;
+                p.allowed += r.allowed;
+                p.denied += r.denied;
+                p.last_seen = p.last_seen.max(r.last_seen);
+                p.servers.push(MapServer {
+                    app: app.stats.name.clone(),
+                    identity: app.stats.identity.clone(),
+                    host: r.host.clone(),
+                    ip: r.ip.clone(),
+                    ports: r.ports.clone(),
+                    org: g.org.clone(),
+                    tx: r.tx,
+                    rx: r.rx,
+                    tx_rate: r.tx_rate,
+                    rx_rate: r.rx_rate,
+                    active: r.active,
+                    allowed: r.allowed,
+                    denied: r.denied,
+                    last_seen: r.last_seen,
+                    last_action: r.last_action,
+                });
+            }
+        }
+        let mut places: Vec<MapPlace> = places.into_values().collect();
+        for p in &mut places {
+            p.servers.sort_by(|a, b| {
+                (b.tx_rate + b.rx_rate)
+                    .cmp(&(a.tx_rate + a.rx_rate))
+                    .then((b.tx + b.rx).cmp(&(a.tx + a.rx)))
+                    .then(b.last_seen.cmp(&a.last_seen))
+            });
+            let mut seen = HashSet::new();
+            p.apps = p
+                .servers
+                .iter()
+                .filter(|s| seen.insert(s.app.clone()))
+                .map(|s| s.app.clone())
+                .take(8)
+                .collect();
+            let mut seen = HashSet::new();
+            p.orgs = p
+                .servers
+                .iter()
+                .filter_map(|s| s.org.clone())
+                .filter(|o| seen.insert(o.clone()))
+                .take(4)
+                .collect();
+            p.more = p.servers.len().saturating_sub(limit);
+            p.servers.truncate(limit);
+        }
+        places.sort_by(|a, b| {
+            b.live()
+                .cmp(&a.live())
+                .then((b.tx + b.rx).cmp(&(a.tx + a.rx)))
+                .then(b.last_seen.cmp(&a.last_seen))
+        });
+        MapView {
+            home: self.geo.home(&self.settings),
+            geo: self.geo.status(),
+            places,
+            local,
+            unlocated,
+        }
+    }
+
     pub fn hostnames_for(&self, ip: IpAddr) -> Vec<String> {
         self.dns.lookup(ip)
     }
@@ -1025,5 +1166,126 @@ pub mod log {
     }
     pub fn warn(msg: &str) {
         eprintln!("<4>tattle: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn core() -> Core {
+        let dir = std::env::temp_dir().join(format!(
+            "tattle-core-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Core::new(dir, Waker { tx, fd: -1 })
+    }
+
+    fn conn(exe: &str, host: &str, ip: &str) -> Connection {
+        Connection {
+            direction: Direction::Out,
+            proto: Proto::Tcp,
+            local_ip: "192.168.1.10".parse().unwrap(),
+            local_port: 50000,
+            remote_ip: ip.parse().unwrap(),
+            remote_port: 443,
+            hostnames: vec![host.to_string()],
+            process: ProcessInfo {
+                pid: 42,
+                exe: exe.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn place(c: &mut Core, ip: &str, lat: f64, lon: f64, city: &str) {
+        for a in c.apps.values_mut() {
+            for r in a.remotes.values_mut() {
+                if r.ip == ip {
+                    r.geo = Some(GeoInfo {
+                        lat,
+                        lon,
+                        cc: "DE".into(),
+                        country: "Germany".into(),
+                        city: city.into(),
+                        asn: None,
+                        org: Some("Hetzner".into()),
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn map_rolls_servers_up_by_place() {
+        let mut c = core();
+        c.record(
+            &conn("/usr/bin/curl", "a.example", "5.9.0.1"),
+            Action::Allow,
+            Reason::Rule,
+            None,
+            1,
+        );
+        c.record(
+            &conn("/usr/bin/pacman", "b.example", "5.9.0.2"),
+            Action::Allow,
+            Reason::Rule,
+            None,
+            1,
+        );
+        c.record(
+            &conn("/usr/bin/curl", "c.example", "5.9.0.3"),
+            Action::Deny,
+            Reason::Rule,
+            None,
+            1,
+        );
+        c.record(
+            &conn("/usr/bin/curl", "nas.lan", "192.168.1.2"),
+            Action::Allow,
+            Reason::Rule,
+            None,
+            1,
+        );
+        c.record(
+            &conn("/usr/bin/curl", "d.example", "9.9.9.9"),
+            Action::Allow,
+            Reason::Rule,
+            None,
+            1,
+        );
+        // Same city in the database: one place. A different one: another.
+        place(&mut c, "5.9.0.1", 50.48, 12.37, "Falkenstein");
+        place(&mut c, "5.9.0.2", 50.48, 12.37, "Falkenstein");
+        place(&mut c, "5.9.0.3", 52.52, 13.40, "Berlin");
+
+        let m = c.map_view(None, 40);
+        assert_eq!(m.places.len(), 2);
+        assert_eq!((m.local, m.unlocated), (1, 1));
+        let f = m.places.iter().find(|p| p.city == "Falkenstein").unwrap();
+        assert_eq!(f.servers.len(), 2);
+        assert_eq!(f.allowed, 2);
+        assert_eq!(f.orgs, vec!["Hetzner".to_string()]);
+        let mut apps = f.apps.clone();
+        apps.sort();
+        assert_eq!(apps, vec!["curl".to_string(), "pacman".to_string()]);
+        let b = m.places.iter().find(|p| p.city == "Berlin").unwrap();
+        assert!(b.blocked());
+
+        // The server list is capped, with a count of the rest.
+        let m = c.map_view(None, 1);
+        let f = m.places.iter().find(|p| p.city == "Falkenstein").unwrap();
+        assert_eq!((f.servers.len(), f.more), (1, 1));
+
+        // Old servers drop out of a time window.
+        for a in c.apps.values_mut() {
+            for r in a.remotes.values_mut() {
+                r.last_seen = 1;
+            }
+        }
+        assert!(c.map_view(Some(3600), 40).places.is_empty());
+        let _ = std::fs::remove_dir_all(&c.state_dir);
     }
 }

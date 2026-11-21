@@ -42,6 +42,21 @@ enum Cmd {
     },
     /// Open the interactive monitor (default)
     Ui,
+    /// Open the monitor on the world map; --list prints places instead
+    Map {
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        json: bool,
+        /// Only servers seen in the last so many minutes
+        #[arg(long)]
+        minutes: Option<u64>,
+    },
+    /// Location data for the map: status, update, or set your position
+    Geo {
+        #[command(subcommand)]
+        cmd: Option<cli::GeoCmd>,
+    },
     /// Show daemon status
     Status {
         #[arg(long)]
@@ -106,7 +121,14 @@ fn main() {
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
     let result = match cli.cmd {
-        None | Some(Cmd::Ui) => tui::run(),
+        None | Some(Cmd::Ui) => tui::run(tui::Tab::Monitor),
+        Some(Cmd::Map {
+            list: false,
+            json: false,
+            minutes: _,
+        }) => tui::run(tui::Tab::Map),
+        Some(Cmd::Map { json, minutes, .. }) => cli::map(json, minutes),
+        Some(Cmd::Geo { cmd }) => cli::geo(cmd.unwrap_or(cli::GeoCmd::Status)),
         Some(Cmd::Daemon {
             state_dir,
             socket,

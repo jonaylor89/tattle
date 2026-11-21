@@ -3,6 +3,7 @@
 
 mod draw;
 mod editor;
+mod map;
 
 use crate::client::{self, Client};
 use crate::model::*;
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Monitor,
+    Map,
     Rules,
     Log,
     Blocklists,
@@ -24,8 +26,9 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Monitor,
+        Tab::Map,
         Tab::Rules,
         Tab::Log,
         Tab::Blocklists,
@@ -34,6 +37,7 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Tab::Monitor => "Monitor",
+            Tab::Map => "Map",
             Tab::Rules => "Rules",
             Tab::Log => "Log",
             Tab::Blocklists => "Blocklists",
@@ -46,6 +50,42 @@ impl Tab {
 pub enum Focus {
     Apps,
     Remotes,
+}
+
+/// How far back the map looks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MapWindow {
+    Live,
+    Hour,
+    Day,
+    All,
+}
+
+impl MapWindow {
+    fn next(self) -> MapWindow {
+        match self {
+            MapWindow::Live => MapWindow::Hour,
+            MapWindow::Hour => MapWindow::Day,
+            MapWindow::Day => MapWindow::All,
+            MapWindow::All => MapWindow::Live,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            MapWindow::Live => "last minute",
+            MapWindow::Hour => "last hour",
+            MapWindow::Day => "last day",
+            MapWindow::All => "since start",
+        }
+    }
+    fn secs(self) -> Option<u64> {
+        match self {
+            MapWindow::Live => Some(60),
+            MapWindow::Hour => Some(3600),
+            MapWindow::Day => Some(86_400),
+            MapWindow::All => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,6 +217,15 @@ pub struct App {
     pub filter: Input,
     pub filtering: bool,
     pub log_denied_only: bool,
+    pub map: MapView,
+    pub map_window: MapWindow,
+    pub place_sel: usize,
+    /// Focus is on the selected place's server list.
+    pub map_servers: bool,
+    pub server_sel: usize,
+    last_map: Option<Instant>,
+    /// Drives the map's animation.
+    pub epoch: Instant,
     pub toast: Option<(String, bool, Instant)>,
     pub tick: u64,
     apps_dirty: bool,
@@ -227,6 +276,13 @@ impl App {
             filter: Input::default(),
             filtering: false,
             log_denied_only: false,
+            map: MapView::default(),
+            map_window: MapWindow::Hour,
+            place_sel: 0,
+            map_servers: false,
+            server_sel: 0,
+            last_map: None,
+            epoch: Instant::now(),
             toast: None,
             tick: 0,
             apps_dirty: false,
@@ -266,6 +322,61 @@ impl App {
         }
         self.apps_dirty = false;
         self.last_apps = Instant::now();
+    }
+
+    fn reload_map(&mut self) {
+        let before = self.selected_place().map(map::place_key);
+        if let Ok(m) = self.client.get::<MapView>(Request::Map {
+            since: self.map_window.secs(),
+            limit: Some(60),
+        }) {
+            self.map = m;
+        }
+        self.last_map = Some(Instant::now());
+        // Keep the same place selected as the busiest-first order shifts.
+        if let Some(key) = before
+            && let Some(i) = self
+                .filtered_places()
+                .iter()
+                .position(|p| map::place_key(p) == key)
+        {
+            self.place_sel = i;
+        }
+    }
+
+    pub fn filtered_places(&self) -> Vec<&MapPlace> {
+        let q = self.filter.value.to_lowercase();
+        self.map
+            .places
+            .iter()
+            .filter(|p| {
+                q.is_empty() || map::place_matches(p, &q) || !self.place_servers(p).is_empty()
+            })
+            .collect()
+    }
+
+    pub fn selected_place(&self) -> Option<&MapPlace> {
+        let v = self.filtered_places();
+        v.get(self.place_sel.min(v.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// The servers of a place worth listing under the current filter.
+    pub fn place_servers<'a>(&self, p: &'a MapPlace) -> Vec<&'a MapServer> {
+        let q = self.filter.value.to_lowercase();
+        if q.is_empty() || map::place_matches(p, &q) {
+            return p.servers.iter().collect();
+        }
+        p.servers
+            .iter()
+            .filter(|s| {
+                s.host.to_lowercase().contains(&q)
+                    || s.app.to_lowercase().contains(&q)
+                    || s.org
+                        .as_deref()
+                        .is_some_and(|o| o.to_lowercase().contains(&q))
+            })
+            .collect()
     }
 
     fn drain_events(&mut self) {
@@ -726,12 +837,12 @@ impl App {
                 self.filter = Input::default();
                 return;
             }
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 self.tab = Tab::ALL[(c as u8 - b'1') as usize];
                 self.filter = Input::default();
                 return;
             }
-            KeyCode::Tab if self.tab != Tab::Monitor => {
+            KeyCode::Tab if !matches!(self.tab, Tab::Monitor | Tab::Map) => {
                 let i = Tab::ALL.iter().position(|t| *t == self.tab).unwrap();
                 self.tab = Tab::ALL[(i + 1) % Tab::ALL.len()];
                 return;
@@ -768,6 +879,7 @@ impl App {
 
         match self.tab {
             Tab::Monitor => self.monitor_key(k),
+            Tab::Map => self.map_key(k),
             Tab::Rules => self.rules_key(k),
             Tab::Log => self.log_key(k),
             Tab::Blocklists => self.blocklists_key(k),
@@ -823,6 +935,89 @@ impl App {
                     }
                 }
                 self.modal = Modal::Editor(Box::new(ed));
+            }
+            _ => {}
+        }
+    }
+
+    fn map_key(&mut self, k: KeyEvent) {
+        let nplaces = self.filtered_places().len();
+        let nservers = self
+            .selected_place()
+            .map(|p| self.place_servers(p).len())
+            .unwrap_or(0);
+        match k.code {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter
+                if !self.map_servers && nservers > 0 =>
+            {
+                self.map_servers = true;
+                self.server_sel = self.server_sel.min(nservers - 1);
+            }
+            KeyCode::Tab | KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc
+                if self.map_servers =>
+            {
+                self.map_servers = false
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.map_servers {
+                    self.server_sel = self.server_sel.saturating_sub(1);
+                } else {
+                    self.place_sel = self.place_sel.saturating_sub(1);
+                    self.server_sel = 0;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.map_servers {
+                    self.server_sel = (self.server_sel + 1).min(nservers.saturating_sub(1));
+                } else {
+                    self.place_sel = (self.place_sel + 1).min(nplaces.saturating_sub(1));
+                    self.server_sel = 0;
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.place_sel = 0;
+                self.server_sel = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.place_sel = nplaces.saturating_sub(1);
+                self.server_sel = 0;
+            }
+            KeyCode::Char('w') => {
+                self.map_window = self.map_window.next();
+                self.place_sel = 0;
+                self.server_sel = 0;
+                self.reload_map();
+                self.say(format!("Map: {}", self.map_window.label()));
+            }
+            KeyCode::Char('u') => {
+                if self.map.geo.state == GeoState::Downloading {
+                    self.say("Already downloading the location database");
+                } else if self.call(Request::GeoUpdate) {
+                    self.say("Downloading the location database from db-ip.com…");
+                    self.map.geo.state = GeoState::Downloading;
+                }
+            }
+            KeyCode::Char(c @ ('a' | 'd')) if self.map_servers => {
+                let server = self.selected_place().and_then(|p| {
+                    self.place_servers(p)
+                        .get(self.server_sel)
+                        .map(|s| (*s).clone())
+                });
+                if let Some(s) = server
+                    && s.identity != ANY_PROCESS
+                {
+                    let action = if c == 'a' {
+                        Action::Allow
+                    } else {
+                        Action::Deny
+                    };
+                    let remote = Remote::parse(&s.host).unwrap_or(Remote::Ip(s.ip.clone()));
+                    let rule = Rule::new(action, s.identity.clone(), remote);
+                    let summary = rule.summary();
+                    if self.call(Request::AddRule { rule }) {
+                        self.say(format!("Rule added: {summary}"));
+                    }
+                }
             }
             _ => {}
         }
@@ -1160,8 +1355,9 @@ fn push_hist(h: &mut VecDeque<u64>, v: u64) {
     h.push_back(v);
 }
 
-pub fn run() -> Result<()> {
+pub fn run(start: Tab) -> Result<()> {
     let mut app = App::new()?;
+    app.tab = start;
     let mut terminal = ratatui::init();
     let res = (|| -> Result<()> {
         let mut last_tick = Instant::now();
@@ -1169,6 +1365,13 @@ pub fn run() -> Result<()> {
             app.drain_events();
             if app.apps_dirty && app.last_apps.elapsed() > Duration::from_millis(1000) {
                 app.reload_apps();
+            }
+            if app.tab == Tab::Map
+                && app
+                    .last_map
+                    .is_none_or(|t| t.elapsed() > Duration::from_millis(2000))
+            {
+                app.reload_map();
             }
             if let Some((_, _, t)) = &app.toast
                 && t.elapsed() > Duration::from_secs(4)

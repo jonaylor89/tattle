@@ -15,4 +15,4 @@ if [[ ${1:-} == "--purge" ]]; then
 else
   echo "Removed tattle. Rules kept in /var/lib/tattle (use --purge to delete them)."
 fi
-echo "Remove the shell plugin with: omarchy plugin remove tattle"
+echo "Remove the shell plugin with: omarchy plugin remove jonaylor89.tattle"

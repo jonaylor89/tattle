@@ -82,6 +82,205 @@ fn resolve_process(p: &str) -> Result<String> {
     bail!("'{p}' is not an absolute path and was not found in PATH")
 }
 
+#[derive(Subcommand, Clone)]
+pub enum GeoCmd {
+    /// Show the location database and where the map puts you
+    Status,
+    /// Download DB-IP City Lite (free, CC BY 4.0; about 60 MB) and keep it current
+    Update,
+    /// Look up where an address is (offline, in the local database)
+    Locate { ip: std::net::IpAddr },
+    /// Set where the map puts you: LAT,LON — or "auto" for your time zone's city
+    Home {
+        #[arg(allow_hyphen_values = true)]
+        at: String,
+    },
+}
+
+pub fn geo(cmd: GeoCmd) -> Result<()> {
+    let mut c = Client::connect()?;
+    let view = |c: &mut Client| -> Result<MapView> {
+        c.get(Request::Map {
+            since: Some(0),
+            limit: Some(0),
+        })
+    };
+    match cmd {
+        GeoCmd::Status => {
+            let m = view(&mut c)?;
+            let s: Status = c.get(Request::Status)?;
+            match m.geo.state {
+                GeoState::Ready => {
+                    println!(
+                        "location data  {}",
+                        m.geo.source.as_deref().unwrap_or("ready")
+                    );
+                    println!(
+                        "               {}{}",
+                        m.geo.path.as_deref().unwrap_or(""),
+                        if m.geo.has_asn {
+                            "  (+ network owners)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                GeoState::Downloading => println!("location data  downloading…"),
+                GeoState::Missing => {
+                    println!("location data  not installed");
+                    println!(
+                        "               tattle geo update   fetches DB-IP City Lite (about 60 MB, CC BY 4.0)"
+                    );
+                    println!(
+                        "               Lookups happen on this machine; nothing about your traffic is sent anywhere."
+                    );
+                }
+            }
+            if let Some(e) = &m.geo.error {
+                println!("               last download failed: {e}");
+            }
+            match &m.home {
+                Some(h) => println!("you are        {:.2}, {:.2}  ({})", h.lat, h.lon, h.label),
+                None => println!(
+                    "you are        unknown (time zone has no city): tattle geo home LAT,LON"
+                ),
+            }
+            if m.geo.state == GeoState::Ready {
+                println!(
+                    "auto-update    {}",
+                    if s.settings.geo_auto_update {
+                        "monthly"
+                    } else {
+                        "off"
+                    }
+                );
+            }
+        }
+        GeoCmd::Locate { ip } => {
+            let g: Option<GeoInfo> = c.get(Request::Locate { ip })?;
+            match g {
+                Some(g) => {
+                    println!("{}  ({:.2}, {:.2})", g.place(), g.lat, g.lon);
+                    if let Some(org) = g.org {
+                        println!(
+                            "{org}{}",
+                            g.asn.map(|a| format!("  (AS{a})")).unwrap_or_default()
+                        );
+                    }
+                }
+                None if is_local_ip(ip) => println!("{ip} is on the local network"),
+                None if view(&mut c)?.geo.state != GeoState::Ready => {
+                    bail!("no location data yet; run: tattle geo update")
+                }
+                None => println!("{ip} is not in the location database"),
+            }
+        }
+        GeoCmd::Update => {
+            c.call(Request::GeoUpdate)?;
+            eprint!("downloading the location database from db-ip.com ");
+            let started = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let m = view(&mut c)?;
+                if m.geo.state != GeoState::Downloading {
+                    eprintln!();
+                    if let Some(e) = m.geo.error {
+                        bail!("download failed: {e}");
+                    }
+                    println!("ready: {}", m.geo.source.unwrap_or_default());
+                    break;
+                }
+                if started.elapsed().as_secs() > 1200 {
+                    eprintln!();
+                    bail!("still downloading after 20 minutes; check `journalctl -u tattle`");
+                }
+                eprint!(".");
+            }
+        }
+        GeoCmd::Home { at } => {
+            let mut s: Status = c.get(Request::Status)?;
+            s.settings.home = if at == "auto" {
+                None
+            } else {
+                Some(Coord::parse(&at).map_err(|e| anyhow!(e))?)
+            };
+            c.call(Request::SetSettings {
+                settings: s.settings,
+            })?;
+            let m = view(&mut c)?;
+            match m.home {
+                Some(h) => println!(
+                    "the map puts you at {:.2}, {:.2} ({})",
+                    h.lat, h.lon, h.label
+                ),
+                None => {
+                    println!("your time zone has no city; set one with: tattle geo home LAT,LON")
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn map(json: bool, minutes: Option<u64>) -> Result<()> {
+    let m: MapView = Client::connect()?.get(Request::Map {
+        since: minutes.map(|m| m * 60),
+        limit: Some(if json { 60 } else { 0 }),
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&m)?);
+        return Ok(());
+    }
+    if m.geo.state != GeoState::Ready {
+        bail!("no location data yet; run: tattle geo update");
+    }
+    let home = m.home.as_ref().map(|h| Coord {
+        lat: h.lat,
+        lon: h.lon,
+    });
+    println!(
+        "{:<2} {:<26} {:>8} {:>10} {:>10} {:>5}  APPS",
+        "", "PLACE", "DISTANCE", "SENT", "RECEIVED", "LIVE"
+    );
+    for p in &m.places {
+        let dist = home
+            .map(|h| {
+                format!(
+                    "{:.0} km",
+                    h.distance_km(Coord {
+                        lat: p.lat,
+                        lon: p.lon
+                    })
+                )
+            })
+            .unwrap_or_default();
+        let mut place = p.place();
+        if place.chars().count() > 26 {
+            place = place.chars().take(25).collect::<String>() + "…";
+        }
+        println!(
+            "{:<2} {:<26} {:>8} {:>10} {:>10} {:>5}  {}",
+            p.cc,
+            place,
+            dist,
+            human_bytes(p.tx),
+            human_bytes(p.rx),
+            p.active,
+            p.apps.join(", ")
+        );
+    }
+    if m.local + m.unlocated > 0 {
+        println!(
+            "\n{} on the local network, {} not in the database",
+            m.local, m.unlocated
+        );
+    }
+    if let Some(src) = m.geo.source {
+        println!("{src}");
+    }
+    Ok(())
+}
+
 pub fn status(json: bool) -> Result<()> {
     let mut c = Client::connect()?;
     let s: Status = c.get(Request::Status)?;

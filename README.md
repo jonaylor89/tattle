@@ -8,7 +8,7 @@
 [![Release](https://img.shields.io/github/v/release/jonaylor89/tattle?sort=semver)](https://github.com/jonaylor89/tattle/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-<img src="docs/screenshots/alert.webp" alt="A Tattle connection alert: spotify wants to connect to spclient.wg.spotify.com" width="760">
+<img src="docs/screenshots/desktop.webp" alt="Tattle on an Omarchy desktop: a connection alert for spotify, and the bar panel with a live world map of where apps connect" width="880">
 
 </div>
 
@@ -35,6 +35,10 @@ desktop, and remembers your answer.
   *this app / any app*, for *once / until the app quits / forever / 1 hour*.
 - **Live traffic monitor**: per-app bytes and rates from the kernel's own
   connection tracker, per-server breakdowns, and a traffic graph.
+- **World map**: every place your apps talk to, with an arc from you to each one,
+  packets in flight, and blocked connections in red. Pick a place to see which
+  apps reach which servers there, and who owns the network. Alerts say where a
+  server is, too. Location lookups are offline, on your machine.
 - **Rules**: allow and deny by app, host, domain, IP/CIDR, local network, port and port
   range, protocol, direction, user, and profile, with optional expiry.
 - **Silent modes**: allow or deny everything unknown without asking (all of it still
@@ -87,6 +91,10 @@ Or build the Arch package: `cd packaging/arch && makepkg -si`, then
 Controlling Tattle requires membership in the `wheel` group (Omarchy's default user
 already has it).
 
+**Requirements:** Linux with nftables (`nft`), systemd and curl, all present on
+Omarchy. Building from source needs Rust. The map's location database is optional
+and downloaded only when you ask for it ([below](#the-map)).
+
 ## Using it
 
 ### Alerts
@@ -125,10 +133,13 @@ Run `tattle`. It follows your Omarchy theme (it uses your terminal's palette).
 | Tab | |
 |---|---|
 | **1 Monitor** | Apps with live activity sparklines; pick one to see each server it talked to. `a`/`d` allows or denies the selected server, `A`/`D` the whole app. |
-| **2 Rules** | Every rule with hit counts. `n` new, `enter` edit, `space` enable/disable, `t` flip allow/deny, `x` delete. |
-| **3 Log** | Every decision, live. `b` shows denied only; `a`/`d` turns a line into a rule. |
-| **4 Blocklists** | `p` subscribes to a well-known list, `n` adds your own. |
-| **5 Settings** | Mode, profiles, timeouts, inbound filtering, and resets. |
+| **2 Map** | Where your apps connect. `↑↓` picks a place, `→` its servers (`a`/`d` makes a rule), `w` changes the time window. |
+| **3 Rules** | Every rule with hit counts. `n` new, `enter` edit, `space` enable/disable, `t` flip allow/deny, `x` delete. |
+| **4 Log** | Every decision, live. `b` shows denied only; `a`/`d` turns a line into a rule. |
+| **5 Blocklists** | `p` subscribes to a well-known list, `n` adds your own. |
+| **6 Settings** | Mode, profiles, timeouts, inbound filtering, and resets. |
+
+<img src="docs/screenshots/map.png" alt="The Map tab: arcs from New York to servers around the world, with Amsterdam selected showing Telegram and pacman">
 
 <img src="docs/screenshots/rules.png" alt="The Rules tab: every rule with its scope and hit count">
 
@@ -136,6 +147,27 @@ Run `tattle`. It follows your Omarchy theme (it uses your terminal's palette).
 too, which is handy over SSH or outside Omarchy:
 
 <img src="docs/screenshots/monitor-alert.png" alt="A connection alert inside the terminal monitor">
+
+### The map
+
+The map needs to know where IP addresses are. Tattle never asks an online service
+for that (that would tell a third party every server you talk to). It reads an
+offline database instead:
+
+```bash
+tattle geo update      # download DB-IP City Lite (free, CC BY 4.0, ~60 MB), refreshed monthly
+tattle geo             # what's installed, and where the map puts you
+tattle geo locate 1.1.1.1
+tattle geo home 52.52,13.40   # the map puts you in your time zone's city by default
+```
+
+The download is the only time Tattle contacts anyone, and only when you ask
+(`u` on the Map tab or **Get it** in the panel do the same). If you already keep
+a MaxMind GeoLite2-City database in `/usr/share/GeoIP` or `/var/lib/GeoIP`
+(for example with `geoipupdate`), Tattle uses that instead.
+
+`tattle map` opens the monitor on the map; `tattle map --list` prints the
+places as a table.
 
 ### The CLI
 
@@ -154,6 +186,8 @@ tattle apps                                 # per-app traffic
 tattle blocklist presets / tattle blocklist preset 1
 tattle profile Work
 tattle export > rules.json / tattle import rules.json
+tattle map --list                           # where your apps connect
+tattle geo locate 140.82.112.3              # offline: San Francisco, GitHub, Inc.
 ```
 
 ## How rules are chosen
@@ -203,6 +237,10 @@ and *Settings → Restore built-in rules* brings them back.
 - Packets waiting on an alert are held in the queue and grouped, so retransmits and
   parallel requests produce one alert.
 - Rules and settings live in `/var/lib/tattle/*.json`, written atomically.
+- Locations come from a memory-mapped MaxMind-format database, so a lookup takes
+  microseconds and the daemon's memory barely grows. The map's coastlines are a
+  half-degree land mask rasterized from Natural Earth
+  ([`tools/gen-land.py`](tools/gen-land.py)).
 
 ## Security notes
 
@@ -253,7 +291,7 @@ taking keyboard focus while you iterate on it.
 
 ```bash
 bash uninstall.sh          # keeps your rules; --purge removes them
-omarchy plugin remove tattle
+omarchy plugin remove jonaylor89.tattle
 ```
 
 ## Acknowledgements
@@ -261,6 +299,8 @@ omarchy plugin remove tattle
 Inspired by [Little Snitch](https://www.obdev.at/products/littlesnitch/) (not affiliated) and
 [OpenSnitch](https://github.com/evilsocket/opensnitch). Blocklists are maintained by
 [HaGeZi](https://github.com/hagezi/dns-blocklists) and [StevenBlack](https://github.com/StevenBlack/hosts).
+[IP geolocation by DB-IP](https://db-ip.com) (CC BY 4.0, downloaded on request, not bundled).
+Map outlines from [Natural Earth](https://www.naturalearthdata.com) (public domain).
 The screenshots show a scripted demo session in the default *Tokyo Night* theme.
 
 ## License

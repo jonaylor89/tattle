@@ -3,6 +3,7 @@
 
 use super::blocklist;
 use super::core::{Core, log};
+use super::geo;
 use super::nft::{self, NftConfig};
 use crate::model::*;
 use crate::proto::{Envelope, Reply, Request};
@@ -339,6 +340,20 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
             let core = core.clone();
             std::thread::spawn(move || blocklist::refresh(core, None));
             Ok(json!({ "refreshing": true }))
+        }
+        Request::Map { since, limit } => to_value(
+            core.lock()
+                .unwrap()
+                .map_view(since, limit.unwrap_or(40).min(500)),
+        ),
+        Request::Locate { ip } => to_value(core.lock().unwrap().geo.lookup(ip)),
+        Request::GeoUpdate => {
+            if core.lock().unwrap().geo.downloading {
+                bail!("already downloading");
+            }
+            let core = core.clone();
+            std::thread::spawn(move || geo::download(core));
+            Ok(json!({ "downloading": true }))
         }
         Request::ResetStats => {
             core.lock().unwrap().reset_stats();
