@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jonaylor89.tattle",
   "name": "Tattle",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": "jonaylor89",
   "license": "MIT",
   "description": "Application firewall in the spirit of Little Snitch: asks before apps phone home, maps where they connect, shows live per-app traffic, and remembers your rules.",
