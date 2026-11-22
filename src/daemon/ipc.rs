@@ -258,21 +258,7 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
             Ok(json!({}))
         }
         Request::RemoveProfile { name } => {
-            let mut c = core.lock().unwrap();
-            let prev = c.settings.clone();
-            c.settings.profiles.retain(|p| *p != name);
-            if c.settings.active_profile.as_deref() == Some(name.as_str()) {
-                c.settings.active_profile = None;
-            }
-            // Rules of a deleted profile would never apply again.
-            let prev_rules = c.rules.clone();
-            c.rules
-                .retain(|r| r.profile.as_deref() != Some(name.as_str()));
-            // Settings first: if that fails nothing has been written yet.
-            c.settings_changed(prev)?;
-            if c.rules.len() != prev_rules.len() {
-                c.rules_changed(prev_rules)?;
-            }
+            core.lock().unwrap().remove_profile(&name)?;
             Ok(json!({}))
         }
         Request::SetSettings { settings } => {
@@ -308,17 +294,7 @@ fn handle(ctx: &Ctx, client_id: u64, req: Request) -> Result<Value> {
             Ok(json!({ "refreshing": true }))
         }
         Request::RemoveBlocklist { name } => {
-            {
-                let mut c = core.lock().unwrap();
-                let prev = c.settings.clone();
-                let before = c.settings.blocklists.len();
-                c.settings.blocklists.retain(|b| b.name != name);
-                if before == c.settings.blocklists.len() {
-                    return Err(anyhow!("no blocklist '{name}'"));
-                }
-                blocklist::remove_cache(&c.state_dir, &name);
-                c.settings_changed(prev)?;
-            }
+            core.lock().unwrap().remove_blocklist(&name)?;
             blocklist::rebuild(core);
             Ok(json!({}))
         }

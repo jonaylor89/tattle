@@ -702,6 +702,60 @@ impl Core {
         Ok(())
     }
 
+    /// Delete a profile and the rules that only applied in it. Both files
+    /// are saved before anything else changes; if either save fails, the
+    /// in-memory policy and the files are put back as they were.
+    pub fn remove_profile(&mut self, name: &str) -> Result<()> {
+        let prev = self.settings.clone();
+        let prev_rules = self.rules.clone();
+        self.settings.profiles.retain(|p| p != name);
+        if self.settings.active_profile.as_deref() == Some(name) {
+            self.settings.active_profile = None;
+        }
+        // Rules of a deleted profile would never apply again.
+        self.rules.retain(|r| r.profile.as_deref() != Some(name));
+        let rules_touched = self.rules.len() != prev_rules.len();
+
+        if let Err(e) = self.save_settings() {
+            self.settings = prev;
+            self.rules = prev_rules;
+            return Err(e);
+        }
+        if rules_touched && let Err(e) = self.save_rules() {
+            self.settings = prev;
+            self.rules = prev_rules;
+            // settings.json already lost the profile; put it back. If that
+            // fails too, the rules file still has the profile's rules, so a
+            // restart loses nothing but the profile name, and says so.
+            if let Err(e2) = self.save_settings() {
+                log::warn(&format!(
+                    "could not restore settings after failed save: {e2}"
+                ));
+            }
+            return Err(e);
+        }
+        if rules_touched {
+            self.broadcast(&Event::RulesChanged);
+        }
+        self.reevaluate_prompts();
+        self.broadcast_status();
+        Ok(())
+    }
+
+    /// Unsubscribe from a blocklist. Its cached entries are deleted only
+    /// after the settings without it have been saved, so a failed save
+    /// leaves the list enabled and still enforced.
+    pub fn remove_blocklist(&mut self, name: &str) -> Result<()> {
+        let prev = self.settings.clone();
+        self.settings.blocklists.retain(|b| b.name != name);
+        if self.settings.blocklists.len() == prev.blocklists.len() {
+            bail!("no blocklist '{name}'");
+        }
+        self.settings_changed(prev)?;
+        super::blocklist::remove_cache(&self.state_dir, name);
+        Ok(())
+    }
+
     pub fn set_settings(&mut self, mut s: Settings) -> Result<bool> {
         s.prompt_timeout = s.prompt_timeout.clamp(5, 3600);
         s.profiles.retain(|p| !p.trim().is_empty() && p.len() <= 64);
@@ -1322,6 +1376,105 @@ mod tests {
         s.prompt_timeout = settings.prompt_timeout + 7;
         assert!(c.set_settings(s).is_err());
         assert_eq!(c.settings.prompt_timeout, settings.prompt_timeout);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Make every later save of `name` fail, even as root: a directory
+    /// can't be renamed over.
+    fn break_saves(dir: &std::path::Path, name: &str) {
+        let _ = std::fs::remove_file(dir.join(name));
+        std::fs::create_dir(dir.join(name)).unwrap();
+    }
+
+    fn unbreak_saves(dir: &std::path::Path, name: &str) {
+        std::fs::remove_dir(dir.join(name)).unwrap();
+    }
+
+    fn with_work_profile(dir: &std::path::Path) -> (Core, u64) {
+        let mut c = core_at(dir).unwrap();
+        let mut s = c.settings.clone();
+        s.profiles.push("Work".into());
+        s.active_profile = Some("Work".into());
+        c.set_settings(s).unwrap();
+        let mut r = user_rule();
+        r.profile = Some("Work".into());
+        let id = c.add_rule(r).unwrap();
+        (c, id)
+    }
+
+    #[test]
+    fn removing_a_profile_is_all_or_nothing() {
+        for broken in ["settings.json", "rules.json"] {
+            let dir = fresh_dir(&format!("profile-{broken}"));
+            let (mut c, id) = with_work_profile(&dir);
+            break_saves(&dir, broken);
+            assert!(c.remove_profile("Work").is_err());
+            // Still in force in the running daemon...
+            assert!(c.rules.iter().any(|r| r.id == id));
+            assert!(c.settings.profiles.iter().any(|p| p == "Work"));
+            assert_eq!(c.settings.active_profile.as_deref(), Some("Work"));
+            // ...and after a restart.
+            unbreak_saves(&dir, broken);
+            if broken == "settings.json" {
+                c.save_settings().unwrap();
+            } else {
+                c.save_rules().unwrap();
+            }
+            let c = core_at(&dir).unwrap();
+            assert!(c.rules.iter().any(|r| r.id == id));
+            assert!(c.settings.profiles.iter().any(|p| p == "Work"));
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn removing_a_profile_drops_its_rules() {
+        let dir = fresh_dir("profile-ok");
+        let (mut c, id) = with_work_profile(&dir);
+        c.remove_profile("Work").unwrap();
+        let c = core_at(&dir).unwrap();
+        assert!(!c.rules.iter().any(|r| r.id == id));
+        assert!(!c.settings.profiles.iter().any(|p| p == "Work"));
+        assert_eq!(c.settings.active_profile, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn with_blocklist(dir: &std::path::Path) -> (Core, PathBuf) {
+        let mut c = core_at(dir).unwrap();
+        c.settings.blocklists.push(Blocklist {
+            name: "ads".into(),
+            url: "https://example.com/ads.txt".into(),
+            enabled: true,
+            entries: 1,
+            updated: Some(1),
+            error: None,
+        });
+        c.save_settings().unwrap();
+        let cache = super::super::blocklist::cache_path(dir, "ads");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "ads.example.com\n").unwrap();
+        (c, cache)
+    }
+
+    #[test]
+    fn failed_blocklist_removal_keeps_list_and_cache() {
+        let dir = fresh_dir("blocklist-fail");
+        let (mut c, cache) = with_blocklist(&dir);
+        break_saves(&dir, "settings.json");
+        assert!(c.remove_blocklist("ads").is_err());
+        assert!(c.settings.blocklists.iter().any(|b| b.name == "ads"));
+        assert!(cache.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn blocklist_removal_deletes_cache_after_saving() {
+        let dir = fresh_dir("blocklist-ok");
+        let (mut c, cache) = with_blocklist(&dir);
+        c.remove_blocklist("ads").unwrap();
+        assert!(!cache.exists());
+        let c = core_at(&dir).unwrap();
+        assert!(!c.settings.blocklists.iter().any(|b| b.name == "ads"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

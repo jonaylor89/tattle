@@ -62,7 +62,7 @@ fn slug(name: &str) -> String {
         .collect()
 }
 
-fn cache_path(dir: &Path, name: &str) -> PathBuf {
+pub(super) fn cache_path(dir: &Path, name: &str) -> PathBuf {
     dir.join("blocklists").join(format!("{}.txt", slug(name)))
 }
 
