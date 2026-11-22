@@ -303,6 +303,11 @@ impl Core {
 
     /// Write `data` to a temp file, flush it to disk, then rename it over
     /// `name`, so a crash leaves either the old file or the new one.
+    ///
+    /// An error means `name` still holds its old contents. Once the rename
+    /// has replaced it, the save counts as done: a failed directory sync
+    /// after that only weakens crash durability, so it is logged rather
+    /// than reported, keeping memory and disk in agreement.
     fn write_atomic(&self, name: &str, data: &str) -> Result<()> {
         use std::io::Write;
         let path = self.state_dir.join(name);
@@ -311,15 +316,38 @@ impl Core {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(data.as_bytes())?;
             f.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            std::fs::File::open(&self.state_dir)?.sync_all()
+            std::fs::rename(&tmp, &path)
         })();
         if let Err(e) = res {
             let _ = std::fs::remove_file(&tmp);
             log::warn(&format!("could not save {}: {e}", path.display()));
             bail!("could not save {}: {e}", path.display());
         }
+        #[cfg(test)]
+        if tests::fail_after_replace(name) {
+            bail!("injected failure after replacing {name}");
+        }
+        if let Err(e) = std::fs::File::open(&self.state_dir).and_then(|d| d.sync_all()) {
+            log::warn(&format!(
+                "saved {}, but syncing {} failed: {e}",
+                path.display(),
+                self.state_dir.display()
+            ));
+        }
         Ok(())
+    }
+
+    /// Undo a change that could not be saved: put the previous policy back
+    /// in memory, then write both files from it, so whatever a failed save
+    /// may have left on disk is replaced by exactly what is enforced.
+    fn roll_back(&mut self, settings: Settings, rules: Vec<Rule>) {
+        self.settings = settings;
+        self.rules = rules;
+        for res in [self.save_settings(), self.save_rules()] {
+            if let Err(e) = res {
+                log::warn(&format!("could not restore saved policy: {e}"));
+            }
+        }
     }
 
     pub fn save_rules(&self) -> Result<()> {
@@ -551,7 +579,9 @@ impl Core {
             if let Err(e) = self.save_rules() {
                 // Leave the alert waiting so the user can retry or pick
                 // a one-off answer; don't pretend the rule exists.
-                self.rules.pop();
+                let mut prev = self.rules.clone();
+                prev.pop();
+                self.roll_back(self.settings.clone(), prev);
                 return Err(e);
             }
         }
@@ -682,7 +712,7 @@ impl Core {
     /// survives a restart.
     pub fn rules_changed(&mut self, prev: Vec<Rule>) -> Result<()> {
         if let Err(e) = self.save_rules() {
-            self.rules = prev;
+            self.roll_back(self.settings.clone(), prev);
             return Err(e);
         }
         self.broadcast(&Event::RulesChanged);
@@ -694,7 +724,7 @@ impl Core {
     /// Like `rules_changed`, for settings.
     pub fn settings_changed(&mut self, prev: Settings) -> Result<()> {
         if let Err(e) = self.save_settings() {
-            self.settings = prev;
+            self.roll_back(prev, self.rules.clone());
             return Err(e);
         }
         self.reevaluate_prompts();
@@ -702,9 +732,9 @@ impl Core {
         Ok(())
     }
 
-    /// Delete a profile and the rules that only applied in it. Both files
-    /// are saved before anything else changes; if either save fails, the
-    /// in-memory policy and the files are put back as they were.
+    /// Delete a profile and the rules that only applied in it. If either
+    /// save fails, at any step, memory and both files are put back as they
+    /// were.
     pub fn remove_profile(&mut self, name: &str) -> Result<()> {
         let prev = self.settings.clone();
         let prev_rules = self.rules.clone();
@@ -717,21 +747,11 @@ impl Core {
         let rules_touched = self.rules.len() != prev_rules.len();
 
         if let Err(e) = self.save_settings() {
-            self.settings = prev;
-            self.rules = prev_rules;
+            self.roll_back(prev, prev_rules);
             return Err(e);
         }
         if rules_touched && let Err(e) = self.save_rules() {
-            self.settings = prev;
-            self.rules = prev_rules;
-            // settings.json already lost the profile; put it back. If that
-            // fails too, the rules file still has the profile's rules, so a
-            // restart loses nothing but the profile name, and says so.
-            if let Err(e2) = self.save_settings() {
-                log::warn(&format!(
-                    "could not restore settings after failed save: {e2}"
-                ));
-            }
+            self.roll_back(prev, prev_rules);
             return Err(e);
         }
         if rules_touched {
@@ -1285,6 +1305,21 @@ pub mod log {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FAIL_AFTER_REPLACE: RefCell<Option<&'static str>> = const { RefCell::new(None) };
+    }
+
+    /// Test hook for `write_atomic`: report an error for `name` after its
+    /// file has already been replaced (like a failing directory sync).
+    pub fn fail_after_replace(name: &str) -> bool {
+        FAIL_AFTER_REPLACE.with(|f| *f.borrow() == Some(name))
+    }
+
+    fn inject_after_replace(name: Option<&'static str>) {
+        FAIL_AFTER_REPLACE.with(|f| *f.borrow_mut() = name);
+    }
 
     fn core() -> Core {
         let dir = std::env::temp_dir().join(format!(
@@ -1436,6 +1471,38 @@ mod tests {
         assert!(!c.rules.iter().any(|r| r.id == id));
         assert!(!c.settings.profiles.iter().any(|p| p == "Work"));
         assert_eq!(c.settings.active_profile, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn error_after_replacing_a_file_still_restores_it() {
+        for file in ["settings.json", "rules.json"] {
+            let dir = fresh_dir(&format!("after-replace-{file}"));
+            let (mut c, id) = with_work_profile(&dir);
+            inject_after_replace(Some(file));
+            assert!(c.remove_profile("Work").is_err());
+            inject_after_replace(None);
+            assert!(c.rules.iter().any(|r| r.id == id));
+            // The files on disk match what is enforced, so a restart
+            // brings back the profile together with its rules.
+            let c = core_at(&dir).unwrap();
+            assert!(c.rules.iter().any(|r| r.id == id), "{file}");
+            assert!(c.settings.profiles.iter().any(|p| p == "Work"), "{file}");
+            assert_eq!(c.settings.active_profile.as_deref(), Some("Work"));
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn error_after_replacing_rules_undoes_an_added_rule_on_disk() {
+        let dir = fresh_dir("after-replace-add");
+        let mut c = core_at(&dir).unwrap();
+        let before = c.rules.len();
+        inject_after_replace(Some("rules.json"));
+        assert!(c.add_rule(user_rule()).is_err());
+        inject_after_replace(None);
+        assert_eq!(c.rules.len(), before);
+        assert_eq!(core_at(&dir).unwrap().rules.len(), before);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
