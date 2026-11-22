@@ -1,6 +1,6 @@
 [package]
 name = "tattle"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Application firewall in the spirit of Little Snitch, with an Omarchy shell plugin"
 license = "MIT"
