@@ -429,7 +429,58 @@ Item {
             }
           }
         }
+
+        // Every answer has a key; show them, so the card never needs a mouse.
+        Flow {
+          width: parent.width
+          spacing: Style.space(14)
+          KeyHint { keys: ["A"]; label: root.t("alert.allow") }
+          KeyHint { keys: ["D"]; label: root.t("alert.deny") }
+          KeyHint { keys: ["Esc"]; label: root.t("alert.later") }
+          KeyHint { keys: ["↑", "↓"]; label: root.t("alert.hintRow") }
+          KeyHint { keys: ["←", "→"]; label: root.t("alert.hintChange") }
+        }
       }
+    }
+  }
+
+  component KeyHint: Row {
+    id: hint
+    property var keys: []
+    property string label: ""
+    spacing: Style.space(4)
+
+    Repeater {
+      model: hint.keys
+      Rectangle {
+        required property string modelData
+        anchors.verticalCenter: parent.verticalCenter
+        width: Math.max(height, capText.implicitWidth + Style.space(10))
+        height: capText.implicitHeight + Style.space(4)
+        radius: Style.cornerRadius > 0 ? Style.space(4) : 0
+        color: Util.alpha(root.fg, 0.08)
+        border.color: Util.alpha(root.fg, 0.28)
+        border.width: 1
+        Text {
+          id: capText
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          text: parent.modelData
+          color: root.fg
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+      }
+    }
+    Text {
+      anchors.verticalCenter: parent.verticalCenter
+      leftPadding: Style.space(2)
+      textFormat: Text.PlainText
+      text: hint.label
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
     }
   }
 

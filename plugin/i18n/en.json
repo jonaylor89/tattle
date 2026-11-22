@@ -19,6 +19,8 @@
   "alert.allow": "Allow",
   "alert.deny": "Deny",
   "alert.later": "Later",
+  "alert.hintRow": "choose",
+  "alert.hintChange": "change",
   "alert.secondsLeft": "%1s",
   "alert.ofCount": "1 of %1",
   "mode.alert": "Ask",
